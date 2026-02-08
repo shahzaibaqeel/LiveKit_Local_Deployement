@@ -1,0 +1,12 @@
+{
+  "name": "1st Project Dispatch",
+  "trunk_ids": ["ST_j4KspRtJyijX"],
+  "rule": {
+    "dispatchRuleIndividual": {
+      "roomPrefix": "1st-project-"
+    }
+  },
+  "attributes": {
+    "agentName": "inbound-agent"
+  }
+}

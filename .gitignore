@@ -1,0 +1,43 @@
+cd ~/livekit-project
+nano .gitignore
+```
+
+Add these lines to exclude large model files:
+```
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+*.egg-info/
+dist/
+build/
+
+# Environment variables
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large model files
+agent/vosk/
+agent/piper/
+agent/models/
+agent/ffmpeg/
+*.bin
+*.onnx
+*.pt
+*.pth
+*.gguf
+*.safetensors
+
+# Dashboard node modules if any
+**/node_modules/

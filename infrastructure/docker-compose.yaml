@@ -1,0 +1,62 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - livekit-network
+
+  livekit:
+    image: livekit/livekit-server:latest
+    ports:
+      - "7880:7880"
+      - "7881:7881/tcp"
+      - "50000-50200:50000-50200/udp"
+    environment:
+      LIVEKIT_KEYS: "devkey: h1J2kL3mN4pQ5rS6tU7vW8xY9zA0bC1d"
+    command: 
+      - --config
+      - /etc/livekit.yaml
+    volumes:
+      - ./livekit-config.yaml:/etc/livekit.yaml
+    depends_on:
+      - redis
+    networks:
+      - livekit-network
+
+  sip:
+    image: livekit/sip:latest
+    environment:
+      SIP_CONFIG_BODY: |
+        api_key: 'devkey'
+        api_secret: 'h1J2kL3mN4pQ5rS6tU7vW8xY9zA0bC1d'
+        ws_url: 'ws://livekit:7880'
+        # ws_url: 'ws://192.168.1.161:7880'
+        redis:
+          address: 'redis:6379'
+        sip_port: 5060
+        rtp_port_range_start: 10000
+        rtp_port_range_end: 10200
+        use_external_ip: true
+        external_ip: "192.168.1.161"
+        logging:
+          level: debug
+    ports:
+      - "5060:5060/udp"
+      - "5060:5060/tcp"
+      - "10000-10200:10000-10200/udp"
+    depends_on:
+      - redis
+      - livekit
+    networks:
+      - livekit-network
+
+networks:
+  livekit-network:
+    name: livekit-network
+    driver: bridge
+
+volumes:
+  redis_data:

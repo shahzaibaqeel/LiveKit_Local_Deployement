@@ -1,0 +1,9 @@
+{
+  "sip_trunk_id": "ST_j4KspRtJyijX",
+  "name": "fusionpbx-trunk",
+  "numbers": ["1005"],
+  "allowed_addresses": ["192.168.2.24"],
+  "auth_username": "1005",
+  "auth_password": "1234"
+}
+

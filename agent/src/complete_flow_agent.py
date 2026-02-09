@@ -20,7 +20,6 @@ from livekit.agents import (
     JobProcess,
     cli,
 )
-from livekit.agents.llm import FunctionContext
 from livekit.plugins import silero
 from livekit.plugins import openai
 
@@ -141,14 +140,13 @@ async def my_agent(ctx: JobContext):
     
     # Track transfer state
     transfer_in_progress = False
-    human_agent_participant = None
     
     # ========================================================================
-    # FUNCTION CALL HANDLER - TRANSFER TO HUMAN AGENT
+    # TRANSFER HANDLER
     # ========================================================================
     async def handle_transfer(reason: str = "customer_request", department: str = "general"):
         """Handle transfer to human agent"""
-        nonlocal transfer_in_progress, human_agent_participant
+        nonlocal transfer_in_progress
         
         logger.info(f"🔴 TRANSFER REQUESTED: reason={reason}, department={department}")
         
@@ -182,7 +180,6 @@ async def my_agent(ctx: JobContext):
                     participant_identity=f"human-agent-{department}",
                     participant_name=f"Human Agent ({department})",
                     participant_metadata=f'{{"reason": "{reason}", "department": "{department}"}}',
-                    krisp_enabled=True,
                 )
             )
             
@@ -205,11 +202,9 @@ async def my_agent(ctx: JobContext):
     @ctx.room.on("participant_connected")
     def on_participant_connected(participant: rtc.RemoteParticipant):
         """Track when human agent joins"""
-        nonlocal human_agent_participant
         logger.info(f"👤 PARTICIPANT JOINED: {participant.identity}")
         
         if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
-            human_agent_participant = participant
             logger.info(f"🟢 HUMAN AGENT CONNECTED: {participant.identity}")
     
     @ctx.room.on("track_subscribed")
@@ -227,8 +222,33 @@ async def my_agent(ctx: JobContext):
         logger.info(f"👋 PARTICIPANT LEFT: {participant.identity}")
     
     # ========================================================================
-    # OPENAI REALTIME SESSION
+    # OPENAI REALTIME SESSION WITH TOOLS
     # ========================================================================
+    
+    # Define transfer tool using OpenAI's tool format
+    transfer_tool = openai.realtime.ToolDefinition(
+        name="transfer_to_agent",
+        description="""Transfer the call to a human agent when user requests to speak with someone 
+        or needs human assistance. Call this immediately when customer says things like:
+        'transfer me to agent', 'I want to talk to human', 'connect me to representative', 
+        'speak to someone', 'need help from person'""",
+        parameters={
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Reason for transfer",
+                    "default": "customer_request"
+                },
+                "department": {
+                    "type": "string", 
+                    "description": "Department to transfer to",
+                    "default": "general"
+                }
+            }
+        }
+    )
+    
     session = AgentSession(
         llm=openai.realtime.RealtimeModel(
             model="gpt-4o-realtime-preview-2024-12-17",
@@ -241,32 +261,29 @@ async def my_agent(ctx: JobContext):
                 "prefix_padding_ms": 300,
                 "silence_duration_ms": 500,
             },
+            tools=[transfer_tool],  # Add tool here
         ),
         vad=ctx.proc.userdata["vad"],
-        fnc_ctx=FunctionContext(),
     )
     
     # ========================================================================
-    # REGISTER TRANSFER FUNCTION - Using @session.fnc_ctx.ai_callable decorator
+    # TOOL CALL HANDLER
     # ========================================================================
-    @session.fnc_ctx.ai_callable(
-        description="""Transfer the call to a human agent when user requests to speak with someone 
-        or needs human assistance. Call this immediately when customer says things like:
-        'transfer me to agent', 'I want to talk to human', 'connect me to representative', 
-        'speak to someone', 'need help from person'"""
-    )
-    async def transfer_to_agent(
-        reason: str = "customer_request",
-        department: str = "general"
-    ):
-        """
-        Transfer call to human agent
-        
-        Args:
-            reason: Reason for transfer (default: 'customer_request')
-            department: Department to transfer to (default: 'general')
-        """
-        return await handle_transfer(reason, department)
+    @session.on("function_calls_collected")
+    async def on_function_calls(function_calls):
+        """Handle function calls from OpenAI"""
+        for fc in function_calls:
+            logger.info(f"🔧 FUNCTION CALLED: {fc.name} with args: {fc.arguments}")
+            
+            if fc.name == "transfer_to_agent":
+                reason = fc.arguments.get("reason", "customer_request")
+                department = fc.arguments.get("department", "general")
+                
+                # Execute transfer
+                result = await handle_transfer(reason, department)
+                
+                # Return result to OpenAI
+                fc.result = result
     
     # ========================================================================
     # SESSION EVENT HANDLERS - SEND TRANSCRIPTS TO CCM

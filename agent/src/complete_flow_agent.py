@@ -124,7 +124,7 @@ async def my_agent(ctx: JobContext):
     # ========================================================================
     # TRANSFER FUNCTION
     # ========================================================================
-    async def execute_transfer():
+    #async def execute_transfer():
         """Execute SIP transfer to human agent"""
         if transfer_triggered["value"]:
             logger.info("⏭️ Transfer already in progress, skipping")
@@ -172,7 +172,58 @@ async def my_agent(ctx: JobContext):
             logger.error(f"❌ TRANSFER FAILED: {e}", exc_info=True)
             transfer_triggered["value"] = False
             await send_to_ccm(call_id, customer_id, "Transfer failed. Please try again.", "BOT")
-    
+    async def execute_transfer():
+    """Execute SIP transfer to human agent"""
+    if transfer_triggered["value"]:
+        logger.info("⏭️ Transfer already in progress, skipping")
+        return
+
+    transfer_triggered["value"] = True
+    logger.info(f"🔴 EXECUTING TRANSFER NOW")
+
+    await send_to_ccm(call_id, customer_id, "Connecting you to our live agent...", "BOT")
+
+    try:
+        livekit_api = api.LiveKitAPI(
+            url=os.getenv("LIVEKIT_URL"),
+            api_key=os.getenv("LIVEKIT_API_KEY"),
+            api_secret=os.getenv("LIVEKIT_API_SECRET")
+        )
+
+        outbound_trunk_id = "ST_W7jqvDFA2VgG"
+        agent_extension = "99900"
+        fusionpbx_ip = "192.168.2.24"  # optional if you need domain
+
+        # ✅ Corrected: only extension, no sip: or port
+        sip_call_to_value = agent_extension  # or f"{agent_extension}@{fusionpbx_ip}" if domain needed
+
+        logger.info(f"📞 Calling: {sip_call_to_value}")
+        logger.info(f"📞 Using trunk: {outbound_trunk_id}")
+        logger.info(f"📞 Room: {call_id}")
+
+        transfer_result = await livekit_api.sip.create_sip_participant(
+            api.CreateSIPParticipantRequest(
+                room_name=call_id,
+                sip_trunk_id=outbound_trunk_id,
+                sip_call_to=sip_call_to_value,
+                participant_identity=f"human-agent-general",
+                participant_name=f"Human Agent",
+                participant_metadata='{"reason": "customer_request"}',
+            )
+        )
+
+        logger.info(f"✅ TRANSFER SUCCESS!")
+        logger.info(f"✅ Participant ID: {transfer_result.participant_id}")
+        logger.info(f"✅ Participant Identity: {transfer_result.participant_identity}")
+        logger.info(f"✅ SIP Call ID: {transfer_result.sip_call_id}")
+
+        await send_to_ccm(call_id, customer_id, "Transfer initiated", "BOT")
+
+    except Exception as e:
+        logger.error(f"❌ TRANSFER FAILED: {e}", exc_info=True)
+        transfer_triggered["value"] = False
+        await send_to_ccm(call_id, customer_id, "Transfer failed. Please try again.", "BOT")
+
     # ========================================================================
     # ROOM EVENTS
     # ========================================================================

@@ -19,6 +19,7 @@ from livekit.agents import (
     JobContext,
     JobProcess,
     cli,
+    function_tool,
 )
 from livekit.plugins import silero
 from livekit.plugins import openai
@@ -138,16 +139,23 @@ async def my_agent(ctx: JobContext):
     
     logger.info(f"🔵 NEW CALL: Room={call_id}, Customer={customer_id}")
     
-    # Track transfer state
-    transfer_in_progress = False
-    
     # ========================================================================
-    # TRANSFER HANDLER
+    # TRANSFER FUNCTION - Using @function_tool decorator
     # ========================================================================
-    async def handle_transfer(reason: str = "customer_request", department: str = "general"):
-        """Handle transfer to human agent"""
-        nonlocal transfer_in_progress
+    @function_tool
+    async def transfer_to_agent(
+        reason: str = "customer_request",
+        department: str = "general"
+    ):
+        """
+        Transfer the call to a human agent when user requests to speak with someone 
+        or needs human assistance. Call this immediately when customer says things like:
+        'transfer me to agent', 'I want to talk to human', 'connect me to representative'
         
+        Args:
+            reason: Reason for transfer (default: 'customer_request')
+            department: Department to transfer to (default: 'general')
+        """
         logger.info(f"🔴 TRANSFER REQUESTED: reason={reason}, department={department}")
         
         # Send acknowledgment to CCM
@@ -155,8 +163,6 @@ async def my_agent(ctx: JobContext):
                          "Connecting you to our live agent...", "BOT")
         
         try:
-            transfer_in_progress = True
-            
             # Initialize LiveKit API client
             livekit_api = api.LiveKitAPI(
                 url=os.getenv("LIVEKIT_URL"),
@@ -191,7 +197,6 @@ async def my_agent(ctx: JobContext):
             
         except Exception as e:
             logger.error(f"❌ TRANSFER FAILED: {e}")
-            transfer_in_progress = False
             await send_to_ccm(call_id, customer_id, 
                              "Unable to transfer your call. Please try again later.", "BOT")
             return f"Transfer failed: {str(e)}"
@@ -222,33 +227,8 @@ async def my_agent(ctx: JobContext):
         logger.info(f"👋 PARTICIPANT LEFT: {participant.identity}")
     
     # ========================================================================
-    # OPENAI REALTIME SESSION WITH TOOLS
+    # OPENAI REALTIME SESSION
     # ========================================================================
-    
-    # Define transfer tool using OpenAI's tool format
-    transfer_tool = openai.realtime.ToolDefinition(
-        name="transfer_to_agent",
-        description="""Transfer the call to a human agent when user requests to speak with someone 
-        or needs human assistance. Call this immediately when customer says things like:
-        'transfer me to agent', 'I want to talk to human', 'connect me to representative', 
-        'speak to someone', 'need help from person'""",
-        parameters={
-            "type": "object",
-            "properties": {
-                "reason": {
-                    "type": "string",
-                    "description": "Reason for transfer",
-                    "default": "customer_request"
-                },
-                "department": {
-                    "type": "string", 
-                    "description": "Department to transfer to",
-                    "default": "general"
-                }
-            }
-        }
-    )
-    
     session = AgentSession(
         llm=openai.realtime.RealtimeModel(
             model="gpt-4o-realtime-preview-2024-12-17",
@@ -261,29 +241,9 @@ async def my_agent(ctx: JobContext):
                 "prefix_padding_ms": 300,
                 "silence_duration_ms": 500,
             },
-            tools=[transfer_tool],  # Add tool here
         ),
         vad=ctx.proc.userdata["vad"],
     )
-    
-    # ========================================================================
-    # TOOL CALL HANDLER
-    # ========================================================================
-    @session.on("function_calls_collected")
-    async def on_function_calls(function_calls):
-        """Handle function calls from OpenAI"""
-        for fc in function_calls:
-            logger.info(f"🔧 FUNCTION CALLED: {fc.name} with args: {fc.arguments}")
-            
-            if fc.name == "transfer_to_agent":
-                reason = fc.arguments.get("reason", "customer_request")
-                department = fc.arguments.get("department", "general")
-                
-                # Execute transfer
-                result = await handle_transfer(reason, department)
-                
-                # Return result to OpenAI
-                fc.result = result
     
     # ========================================================================
     # SESSION EVENT HANDLERS - SEND TRANSCRIPTS TO CCM

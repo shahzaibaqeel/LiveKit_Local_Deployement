@@ -79,6 +79,7 @@ async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type:
             ) as resp:
                 if resp.status == 200:
                     logger.info(f"✅ CCM sent: {sender_type}")
+                    await resp.text()
     except Exception as e:
         logger.error(f"❌ CCM error: {e}")
 

@@ -1,13 +1,13 @@
 """
 ============================================================================
 LIVEKIT AGENT WITH OPENAI REALTIME API + CALL TRANSFER TO HUMAN AGENT
-Uses conversation_item_added event for transcript capture
 ============================================================================
 """
 
 import logging
 import os
 import time
+import asyncio
 from pathlib import Path
 from dotenv import load_dotenv
 import aiohttp
@@ -204,7 +204,7 @@ async def my_agent(ctx: JobContext):
     )
     
     # ========================================================================
-    # CONVERSATION ITEM ADDED EVENT - CORRECT WAY TO GET TRANSCRIPTS
+    # CONVERSATION ITEM ADDED EVENT - FIXED: USE asyncio.create_task
     # ========================================================================
     @session.on("conversation_item_added")
     def on_conversation_item_added(event):
@@ -233,16 +233,16 @@ async def my_agent(ctx: JobContext):
             transfer_keywords = ["transfer", "human", "agent", "representative", "person", "someone"]
             if any(keyword in text_content.lower() for keyword in transfer_keywords):
                 logger.info(f"🔍 TRANSFER KEYWORD DETECTED: '{text_content}'")
-                # Execute transfer
-                ctx._loop.create_task(execute_transfer())
+                # Execute transfer - FIXED: use asyncio.create_task
+                asyncio.create_task(execute_transfer())
             
-            # Send to CCM
-            ctx._loop.create_task(send_to_ccm(call_id, customer_id, text_content, "CONNECTOR"))
+            # Send to CCM - FIXED: use asyncio.create_task
+            asyncio.create_task(send_to_ccm(call_id, customer_id, text_content, "CONNECTOR"))
             
         elif role == "assistant":
             logger.info(f"🤖 AGENT: {text_content}")
-            # Send to CCM
-            ctx._loop.create_task(send_to_ccm(call_id, customer_id, text_content, "BOT"))
+            # Send to CCM - FIXED: use asyncio.create_task
+            asyncio.create_task(send_to_ccm(call_id, customer_id, text_content, "BOT"))
     
     # Start session
     await session.start(

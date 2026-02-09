@@ -19,6 +19,7 @@ from livekit.agents import (
     JobContext,
     JobProcess,
     cli,
+    function_tool,
 )
 from livekit.plugins import silero
 from livekit.plugins import openai
@@ -106,7 +107,8 @@ Common transfer requests:
 - "This isn't working, get me someone"
 - "Connect me to support"
 
-When transferring, say ONLY: "Let me connect you with our team" then call transfer_to_agent.
+Before transferring, briefly acknowledge like "I'll connect you with a human agent right away" 
+and then call the transfer_to_agent function.
 
 For all other requests, provide helpful assistance concisely.""",
         )
@@ -137,14 +139,23 @@ async def my_agent(ctx: JobContext):
     
     logger.info(f"🔵 NEW CALL: Room={call_id}, Customer={customer_id}")
     
-    # Track session for transfer
-    session_ref = {"session": None}
-    
     # ========================================================================
-    # TRANSFER FUNCTION - Defined at module level with proper access
+    # TRANSFER FUNCTION - Using @function_tool decorator
     # ========================================================================
-    async def execute_transfer(reason: str = "customer_request", department: str = "general"):
-        """Execute the actual transfer"""
+    @function_tool
+    async def transfer_to_agent(
+        reason: str = "customer_request",
+        department: str = "general"
+    ):
+        """
+        Transfer the call to a human agent when user requests to speak with someone 
+        or needs human assistance. Call this immediately when customer says things like:
+        'transfer me to agent', 'I want to talk to human', 'connect me to representative'
+        
+        Args:
+            reason: Reason for transfer (default: 'customer_request')
+            department: Department to transfer to (default: 'general')
+        """
         logger.info(f"🔴 TRANSFER REQUESTED: reason={reason}, department={department}")
         
         # Send acknowledgment to CCM
@@ -178,16 +189,14 @@ async def my_agent(ctx: JobContext):
                 )
             )
             
-            logger.info(f"✅ TRANSFER INITIATED: SIP Participant ID = {transfer_result.participant_id}")
-            logger.info(f"✅ Full Transfer Response: {transfer_result}")
-            
+            logger.info(f"✅ TRANSFER INITIATED: {transfer_result}")
             await send_to_ccm(call_id, customer_id, 
                              f"Transfer to {department} department initiated", "BOT")
             
-            return f"Transfer successful. Agent joining room."
+            return f"Transfer initiated to {department} department"
             
         except Exception as e:
-            logger.error(f"❌ TRANSFER FAILED: {e}", exc_info=True)
+            logger.error(f"❌ TRANSFER FAILED: {e}")
             await send_to_ccm(call_id, customer_id, 
                              "Unable to transfer your call. Please try again later.", "BOT")
             return f"Transfer failed: {str(e)}"
@@ -198,12 +207,10 @@ async def my_agent(ctx: JobContext):
     @ctx.room.on("participant_connected")
     def on_participant_connected(participant: rtc.RemoteParticipant):
         """Track when human agent joins"""
-        logger.info(f"👤 PARTICIPANT JOINED: {participant.identity}, Kind: {participant.kind}")
+        logger.info(f"👤 PARTICIPANT JOINED: {participant.identity}")
         
         if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
             logger.info(f"🟢 HUMAN AGENT CONNECTED: {participant.identity}")
-            # Optionally mute AI agent when human joins
-            # session_ref["session"].mute() if session_ref["session"] else None
     
     @ctx.room.on("track_subscribed")
     def on_track_subscribed(
@@ -238,9 +245,6 @@ async def my_agent(ctx: JobContext):
         vad=ctx.proc.userdata["vad"],
     )
     
-    # Store session reference for later use
-    session_ref["session"] = session
-    
     # ========================================================================
     # SESSION EVENT HANDLERS - SEND TRANSCRIPTS TO CCM
     # ========================================================================
@@ -250,14 +254,6 @@ async def my_agent(ctx: JobContext):
         text = msg.content if hasattr(msg, 'content') else str(msg)
         if text:
             logger.info(f"👤 USER: {text}")
-            
-            # Check for transfer keywords
-            transfer_keywords = ["transfer", "human", "agent", "representative", "person", "someone"]
-            if any(keyword in text.lower() for keyword in transfer_keywords):
-                logger.info(f"🔍 TRANSFER KEYWORD DETECTED in user speech")
-                # Create task to execute transfer
-                ctx._loop.create_task(execute_transfer())
-            
             ctx._loop.create_task(
                 send_to_ccm(call_id, customer_id, text, "CONNECTOR")
             )
@@ -271,23 +267,6 @@ async def my_agent(ctx: JobContext):
             ctx._loop.create_task(
                 send_to_ccm(call_id, customer_id, text, "BOT")
             )
-    
-    # ========================================================================
-    # FUNCTION CALL EVENT HANDLER (If OpenAI calls the function)
-    # ========================================================================
-    @session.on("function_calls_collected")
-    async def on_function_calls(function_calls):
-        """Handle function calls from OpenAI (if function calling works)"""
-        for fc in function_calls:
-            logger.info(f"🔧 FUNCTION CALLED: {fc.name} with args: {fc.arguments}")
-            
-            if fc.name == "transfer_to_agent":
-                reason = fc.arguments.get("reason", "customer_request")
-                department = fc.arguments.get("department", "general")
-                
-                # Execute transfer
-                result = await execute_transfer(reason, department)
-                logger.info(f"Transfer result: {result}")
     
     # Start the agent session
     await session.start(

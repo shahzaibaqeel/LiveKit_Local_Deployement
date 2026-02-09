@@ -154,7 +154,7 @@ async def my_agent(ctx: JobContext):
                 api.CreateSIPParticipantRequest(
                     room_name=call_id,
                     sip_trunk_id=outbound_trunk_id,
-                    sip_call_to=f"sip:{agent_extension}@{fusionpbx_ip}:5060",
+                    sip_call_to=f"{agent_extension}@{fusionpbx_ip}",
                     participant_identity=f"human-agent-general",
                     participant_name=f"Human Agent",
                     participant_metadata='{"reason": "customer_request"}',

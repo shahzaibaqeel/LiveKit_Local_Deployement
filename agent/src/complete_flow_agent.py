@@ -19,8 +19,8 @@ from livekit.agents import (
     JobContext,
     JobProcess,
     cli,
-    llm,
 )
+from livekit.agents.llm import FunctionContext
 from livekit.plugins import silero
 from livekit.plugins import openai
 
@@ -87,36 +87,6 @@ async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type:
         logger.error(f"❌ CCM send error: {e}")
 
 # ============================================================================
-# TRANSFER FUNCTION DEFINITION
-# ============================================================================
-transfer_function = llm.FunctionInfo(
-    name="transfer_to_agent",
-    description="""Transfer the call to a human agent when user requests to speak with someone 
-    or needs human assistance. Call this immediately when customer says things like:
-    - 'transfer me to agent'
-    - 'I want to talk to human'
-    - 'connect me to representative'
-    - 'speak to someone'
-    - 'need help from person'""",
-    parameters={
-        "type": "object",
-        "properties": {
-            "reason": {
-                "type": "string",
-                "description": "Reason for transfer (e.g., 'customer_request', 'technical_issue', 'complaint')",
-                "default": "customer_request"
-            },
-            "department": {
-                "type": "string",
-                "description": "Department to transfer to (default: 'general')",
-                "default": "general"
-            }
-        },
-        "required": []
-    }
-)
-
-# ============================================================================
 # AGENT DEFINITION
 # ============================================================================
 class Assistant(Agent):
@@ -165,33 +135,27 @@ async def my_agent(ctx: JobContext):
     
     # Extract call metadata from room
     call_id = ctx.room.name
-    # Try to get customer ID from room metadata or use "unknown"
     customer_id = ctx.room.metadata if ctx.room.metadata else "unknown"
     
     logger.info(f"🔵 NEW CALL: Room={call_id}, Customer={customer_id}")
     
-    # Track if transfer is in progress
+    # Track transfer state
     transfer_in_progress = False
     human_agent_participant = None
     
     # ========================================================================
     # FUNCTION CALL HANDLER - TRANSFER TO HUMAN AGENT
     # ========================================================================
-    async def handle_transfer(function_call: llm.FunctionCallInfo):
+    async def handle_transfer(reason: str = "customer_request", department: str = "general"):
+        """Handle transfer to human agent"""
         nonlocal transfer_in_progress, human_agent_participant
         
-        logger.info(f"🔴 TRANSFER REQUESTED: {function_call.arguments}")
-        
-        reason = function_call.arguments.get("reason", "customer_request")
-        department = function_call.arguments.get("department", "general")
+        logger.info(f"🔴 TRANSFER REQUESTED: reason={reason}, department={department}")
         
         # Send acknowledgment to CCM
         await send_to_ccm(call_id, customer_id, 
                          "Connecting you to our live agent...", "BOT")
         
-        # ====================================================================
-        # INITIATE SIP TRANSFER VIA LIVEKIT API
-        # ====================================================================
         try:
             transfer_in_progress = True
             
@@ -203,46 +167,30 @@ async def my_agent(ctx: JobContext):
             )
             
             # Your outbound trunk configuration
-            outbound_trunk_id = "ST_W7jqvDFA2VgG"  # Your trunk ID
-            agent_extension = "99900"  # Your FusionPBX extension
-            fusionpbx_ip = "192.168.2.24"  # Your FusionPBX IP
+            outbound_trunk_id = "ST_W7jqvDFA2VgG"
+            agent_extension = "99900"
+            fusionpbx_ip = "192.168.2.24"
             
-            # Create SIP call to human agent - joins SAME ROOM as customer
             logger.info(f"📞 Dialing agent: sip:{agent_extension}@{fusionpbx_ip}:5060")
             
+            # Create SIP call to human agent - joins SAME ROOM as customer
             transfer_result = await livekit_api.sip.create_sip_participant(
                 api.CreateSIPParticipantRequest(
-                    # CRITICAL: Same room name keeps customer in same room
-                    room_name=call_id,
-                    
-                    # Outbound trunk to use
+                    room_name=call_id,  # SAME room as customer
                     sip_trunk_id=outbound_trunk_id,
-                    
-                    # SIP URI to dial (your FusionPBX extension)
                     sip_call_to=f"sip:{agent_extension}@{fusionpbx_ip}:5060",
-                    
-                    # Participant identity for human agent
                     participant_identity=f"human-agent-{department}",
                     participant_name=f"Human Agent ({department})",
-                    
-                    # Metadata for tracking
                     participant_metadata=f'{{"reason": "{reason}", "department": "{department}"}}',
-                    
-                    # Enable noise cancellation for agent
                     krisp_enabled=True,
-                    
-                    # Wait for agent to answer before returning
-                    wait_until_answered=False,
                 )
             )
             
             logger.info(f"✅ TRANSFER INITIATED: {transfer_result}")
-            
-            # Send transfer status to CCM
             await send_to_ccm(call_id, customer_id, 
                              f"Transfer to {department} department initiated", "BOT")
             
-            return f"Transfer initiated to {department} department. Agent joining room."
+            return f"Transfer initiated to {department} department"
             
         except Exception as e:
             logger.error(f"❌ TRANSFER FAILED: {e}")
@@ -252,16 +200,14 @@ async def my_agent(ctx: JobContext):
             return f"Transfer failed: {str(e)}"
     
     # ========================================================================
-    # ROOM EVENT LISTENERS - BIDIRECTIONAL TRANSCRIPTION
+    # ROOM EVENT LISTENERS
     # ========================================================================
     @ctx.room.on("participant_connected")
     def on_participant_connected(participant: rtc.RemoteParticipant):
-        """Track when human agent joins the room"""
+        """Track when human agent joins"""
         nonlocal human_agent_participant
-        
         logger.info(f"👤 PARTICIPANT JOINED: {participant.identity}")
         
-        # Check if this is the human agent (SIP participant)
         if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
             human_agent_participant = participant
             logger.info(f"🟢 HUMAN AGENT CONNECTED: {participant.identity}")
@@ -272,15 +218,8 @@ async def my_agent(ctx: JobContext):
         publication: rtc.TrackPublication, 
         participant: rtc.RemoteParticipant
     ):
-        """Handle audio tracks from participants"""
+        """Handle audio tracks"""
         logger.info(f"🎧 TRACK SUBSCRIBED: {participant.identity} - {track.kind}")
-        
-        # If human agent's audio track, set up transcription
-        if (participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP and 
-            track.kind == rtc.TrackKind.KIND_AUDIO):
-            logger.info(f"🎤 Setting up human agent audio transcription")
-            # LiveKit will automatically handle audio mixing
-            # Transcription is handled by the session events below
     
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant):
@@ -288,23 +227,14 @@ async def my_agent(ctx: JobContext):
         logger.info(f"👋 PARTICIPANT LEFT: {participant.identity}")
     
     # ========================================================================
-    # OPENAI REALTIME SESSION WITH FUNCTION CALLING
+    # OPENAI REALTIME SESSION
     # ========================================================================
     session = AgentSession(
         llm=openai.realtime.RealtimeModel(
-            # Model selection
             model="gpt-4o-realtime-preview-2024-12-17",
-            
-            # Voice selection
             voice="alloy",
-            
-            # Temperature
             temperature=0.8,
-            
-            # Modalities: audio for speech-to-speech
             modalities=['text', 'audio'],
-            
-            # Turn detection
             turn_detection={
                 "type": "server_vad",
                 "threshold": 0.5,
@@ -312,38 +242,53 @@ async def my_agent(ctx: JobContext):
                 "silence_duration_ms": 500,
             },
         ),
-        
-        # VAD
         vad=ctx.proc.userdata["vad"],
-        
-        # Function context for transfer
-        fnc_ctx=llm.FunctionContext(),
+        fnc_ctx=FunctionContext(),
     )
     
-    # Register transfer function
-    session.fnc_ctx.ai_callable(transfer_function)(handle_transfer)
+    # ========================================================================
+    # REGISTER TRANSFER FUNCTION - Using @session.fnc_ctx.ai_callable decorator
+    # ========================================================================
+    @session.fnc_ctx.ai_callable(
+        description="""Transfer the call to a human agent when user requests to speak with someone 
+        or needs human assistance. Call this immediately when customer says things like:
+        'transfer me to agent', 'I want to talk to human', 'connect me to representative', 
+        'speak to someone', 'need help from person'"""
+    )
+    async def transfer_to_agent(
+        reason: str = "customer_request",
+        department: str = "general"
+    ):
+        """
+        Transfer call to human agent
+        
+        Args:
+            reason: Reason for transfer (default: 'customer_request')
+            department: Department to transfer to (default: 'general')
+        """
+        return await handle_transfer(reason, department)
     
     # ========================================================================
     # SESSION EVENT HANDLERS - SEND TRANSCRIPTS TO CCM
     # ========================================================================
     @session.on("user_speech_committed")
-    def on_user_speech(msg: llm.ChatMessage):
+    def on_user_speech(msg):
         """Customer speech → Send to CCM"""
-        if msg.content:
-            logger.info(f"👤 USER: {msg.content}")
-            # Run async function in background
+        text = msg.content if hasattr(msg, 'content') else str(msg)
+        if text:
+            logger.info(f"👤 USER: {text}")
             ctx._loop.create_task(
-                send_to_ccm(call_id, customer_id, msg.content, "CONNECTOR")
+                send_to_ccm(call_id, customer_id, text, "CONNECTOR")
             )
     
     @session.on("agent_speech_committed")
-    def on_agent_speech(msg: llm.ChatMessage):
+    def on_agent_speech(msg):
         """AI agent speech → Send to CCM"""
-        if msg.content:
-            logger.info(f"🤖 AGENT: {msg.content}")
-            # Run async function in background
+        text = msg.content if hasattr(msg, 'content') else str(msg)
+        if text:
+            logger.info(f"🤖 AGENT: {text}")
             ctx._loop.create_task(
-                send_to_ccm(call_id, customer_id, msg.content, "BOT")
+                send_to_ccm(call_id, customer_id, text, "BOT")
             )
     
     # Start the agent session

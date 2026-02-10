@@ -37,12 +37,14 @@ logger.setLevel(logging.INFO)
 # CCM API HELPER
 # ============================================================================
 async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type: str):
+    logger.info(f"Start Sending Transcription To CCM {sender_type}")
+
     """Send transcript to CCM API"""
     payload = {
         "id": call_id,
         "header": {
             "channelData": {
-                "channelCustomerIdentifier": customer_id,
+                "channelCustomerIdentifier": 1002,
                 "serviceIdentifier": "682200",
                 "channelTypeCode": "CX_VOICE"
             },
@@ -67,8 +69,10 @@ async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type:
             "type": "PLAIN",
             "markdownText": message
         }
+        
     }
-    
+    logger.info(f"Start Sending Transcription To CCM {payload}")
+
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(

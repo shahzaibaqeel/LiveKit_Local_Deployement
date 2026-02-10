@@ -1,7 +1,7 @@
 """
 ============================================================================
 LIVEKIT AGENT WITH OPENAI REALTIME API + CALL TRANSFER TO HUMAN AGENT
-Uses user_input_transcribed event - THE CORRECT WAY
+Bot leaves when human agent joins - Customer and Agent talk directly
 ============================================================================
 """
 
@@ -21,7 +21,7 @@ from livekit.agents import (
     JobContext,
     JobProcess,
     cli,
-    transcription,
+    stt,
 )
 from livekit.plugins import silero
 from livekit.plugins import openai
@@ -123,6 +123,73 @@ async def my_agent(ctx: JobContext):
     
     transfer_triggered = {"value": False}
     human_agent_joined = {"value": False}
+    session_obj = {"session": None}
+    transcription_task = {"task": None}
+    
+    # ========================================================================
+    # CONTINUOUS TRANSCRIPTION FOR CUSTOMER (After bot leaves)
+    # ========================================================================
+    async def transcribe_customer_audio():
+        """Transcribe customer audio after bot leaves"""
+        logger.info("🎤 Starting customer transcription (post-transfer)")
+        
+        await asyncio.sleep(2)  # Wait for tracks to stabilize
+        
+        try:
+            # Find customer participant (not SIP)
+            customer_participant = None
+            for participant in ctx.room.remote_participants.values():
+                if participant.kind != rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
+                    customer_participant = participant
+                    logger.info(f"✅ Found customer: {participant.identity}")
+                    break
+            
+            if not customer_participant:
+                logger.warning("⚠️ No customer participant found")
+                return
+            
+            # Find customer audio track
+            customer_track = None
+            for track_pub in customer_participant.track_publications.values():
+                if track_pub.track and track_pub.track.kind == rtc.TrackKind.KIND_AUDIO:
+                    customer_track = track_pub.track
+                    logger.info(f"✅ Found customer audio track")
+                    break
+            
+            if not customer_track:
+                logger.warning("⚠️ No customer audio track found")
+                return
+            
+            # Use simple STT with VAD
+            from livekit.agents import tokenize, stt as agents_stt
+            from livekit.agents.llm import LLM
+            
+            # Create STT instance - using OpenAI Whisper
+            stt_instance = openai.STT()
+            
+            # Create audio stream
+            audio_stream = rtc.AudioStream(customer_track)
+            stt_stream = stt_instance.stream()
+            
+            async def forward_audio():
+                async for audio_frame in audio_stream:
+                    stt_stream.push_frame(audio_frame)
+            
+            # Start forwarding audio
+            forward_task = asyncio.create_task(forward_audio())
+            
+            # Process transcriptions
+            async for event in stt_stream:
+                if event.type == agents_stt.SpeechEventType.FINAL_TRANSCRIPT:
+                    text = event.alternatives[0].text.strip()
+                    if text:
+                        logger.info(f"👤 CUSTOMER (to agent): {text}")
+                        await send_to_ccm(call_id, customer_id, text, "CONNECTOR")
+            
+            forward_task.cancel()
+            
+        except Exception as e:
+            logger.error(f"❌ Customer transcription error: {e}", exc_info=True)
     
     # ========================================================================
     # TRANSFER FUNCTION
@@ -182,9 +249,32 @@ async def my_agent(ctx: JobContext):
     @ctx.room.on("participant_connected")
     def on_participant_connected(participant: rtc.RemoteParticipant):
         logger.info(f"👤 JOINED: {participant.identity}, Kind: {participant.kind}, SID: {participant.sid}")
+        
         if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
-            logger.info(f"🟢 HUMAN AGENT CONNECTED TO ROOM")
+            logger.info(f"🟢 HUMAN AGENT CONNECTED - BOT WILL NOW LEAVE")
             human_agent_joined["value"] = True
+            
+            # Stop the bot session
+            async def disconnect_bot():
+                try:
+                    await asyncio.sleep(1)  # Brief delay for stability
+                    
+                    logger.info("🤖 Bot stopping session...")
+                    if session_obj["session"]:
+                        await session_obj["session"].aclose()
+                    
+                    logger.info("🤖 Bot disconnecting from room...")
+                    await ctx.disconnect()
+                    
+                    logger.info("✅ Bot left - Customer and Agent connected")
+                    
+                    # Start transcribing customer
+                    transcription_task["task"] = asyncio.create_task(transcribe_customer_audio())
+                    
+                except Exception as e:
+                    logger.error(f"❌ Error disconnecting bot: {e}")
+            
+            asyncio.create_task(disconnect_bot())
     
     @ctx.room.on("track_subscribed")
     def on_track_subscribed(track: rtc.Track, publication: rtc.TrackPublication, participant: rtc.RemoteParticipant):
@@ -193,29 +283,9 @@ async def my_agent(ctx: JobContext):
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant):
         logger.info(f"👋 LEFT: {participant.identity}")
-    
-    # ========================================================================
-    # ROOM TRANSCRIPTION HANDLER - For continuous transcription
-    # ========================================================================
-    @ctx.room.on("transcription_received")
-    def on_transcription_received(transcription_event: transcription.Transcription):
-        """Handle transcriptions from all participants"""
-        for segment in transcription_event.segments:
-            text = segment.text.strip()
-            participant_identity = transcription_event.participant_identity
-            
-            if not text:
-                continue
-                
-            logger.info(f"📝 TRANSCRIPTION [{participant_identity}]: {text}")
-            
-            # Send to CCM based on who's speaking
-            if human_agent_joined["value"]:
-                # After human joins, customer speech goes as CONNECTOR
-                asyncio.create_task(send_to_ccm(call_id, customer_id, text, "CONNECTOR"))
-            else:
-                # Before human joins, customer speech also goes as CONNECTOR
-                asyncio.create_task(send_to_ccm(call_id, customer_id, text, "CONNECTOR"))
+        if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
+            if transcription_task["task"]:
+                transcription_task["task"].cancel()
     
     # ========================================================================
     # OPENAI REALTIME SESSION
@@ -235,6 +305,8 @@ async def my_agent(ctx: JobContext):
         ),
         vad=ctx.proc.userdata["vad"],
     )
+    
+    session_obj["session"] = session
     
     # ========================================================================
     # USER INPUT TRANSCRIBED EVENT - CORRECT EVENT FOR REALTIME API
@@ -258,14 +330,13 @@ async def my_agent(ctx: JobContext):
         # Send to CCM
         asyncio.create_task(send_to_ccm(call_id, customer_id, transcript, "CONNECTOR"))
         
-        # Check for transfer keywords - only if human hasn't joined yet
-        if not human_agent_joined["value"]:
-            transfer_keywords = ["transfer", "human", "agent", "representative", "person", "someone"]
-            if any(keyword in transcript.lower() for keyword in transfer_keywords):
-                logger.info(f"🔍 TRANSFER KEYWORD DETECTED: '{transcript}'")
-                logger.info(f"🚀 TRIGGERING TRANSFER...")
-                # Execute transfer
-                asyncio.create_task(execute_transfer())
+        # Check for transfer keywords
+        transfer_keywords = ["transfer", "human", "agent", "representative", "person", "someone"]
+        if any(keyword in transcript.lower() for keyword in transfer_keywords):
+            logger.info(f"🔍 TRANSFER KEYWORD DETECTED: '{transcript}'")
+            logger.info(f"🚀 TRIGGERING TRANSFER...")
+            # Execute transfer
+            asyncio.create_task(execute_transfer())
     
     # ========================================================================
     # CONVERSATION ITEM ADDED - FOR AGENT RESPONSES

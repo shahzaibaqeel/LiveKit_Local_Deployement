@@ -293,7 +293,7 @@ async def my_agent(ctx: JobContext):
     # ========================================================================
     async def send_welcome_greeting():
         """Send welcome greeting when call starts"""
-        await asyncio.sleep(0.5)  # Small delay for session stability
+        await asyncio.sleep(1)  # Wait for session to be fully ready
         
         welcome_message = "Welcome to Expertflow Support, let me know how I can help you?"
         logger.info(f"🎙️ Sending welcome greeting: {welcome_message}")
@@ -301,15 +301,9 @@ async def my_agent(ctx: JobContext):
         # Send to CCM
         await send_to_ccm(call_id, customer_id, welcome_message, "BOT")
         
-        # Speak the greeting
+        # Speak the greeting using session.say()
         if session_ref["session"]:
-            session_ref["session"].conversation.item.create(
-                llm.ChatMessage(
-                    role="assistant",
-                    content=welcome_message,
-                )
-            )
-            session_ref["session"].response.create()
+            await session_ref["session"].say(welcome_message, allow_interruptions=True)
     
     asyncio.create_task(send_welcome_greeting())
 

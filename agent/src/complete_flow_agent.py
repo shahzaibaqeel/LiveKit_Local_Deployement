@@ -44,7 +44,7 @@ async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type:
         "id": call_id,
         "header": {
             "channelData": {
-                "channelCustomerIdentifier": customer_id,
+                "channelCustomerIdentifier": 1002,
                 "serviceIdentifier": "682200",
                 "channelTypeCode": "CX_VOICE"
             },
@@ -126,7 +126,6 @@ async def my_agent(ctx: JobContext):
     
     transfer_triggered = {"value": False}
     session_ref = {"session": None}
-    greeting_sent = {"value": False}
     
     # ========================================================================
     # TRANSFER FUNCTION
@@ -206,20 +205,6 @@ async def my_agent(ctx: JobContext):
     @ctx.room.on("track_subscribed")
     def on_track_subscribed(track: rtc.Track, publication: rtc.TrackPublication, participant: rtc.RemoteParticipant):
         logger.info(f"🎧 TRACK: {participant.identity} - {track.kind}")
-        
-        # Send greeting when audio track is ready
-        if track.kind == rtc.TrackKind.KIND_AUDIO and not greeting_sent["value"]:
-            greeting_sent["value"] = True
-            
-            async def send_greeting():
-                await asyncio.sleep(1)
-                welcome_msg = "Welcome to Expertflow Support, let me know how I can help you?"
-                logger.info(f"🎙️ Sending welcome greeting")
-                await send_to_ccm(call_id, customer_id, welcome_msg, "BOT")
-                if session_ref["session"]:
-                    await session_ref["session"].say(welcome_msg, allow_interruptions=True)
-            
-            asyncio.create_task(send_greeting())
     
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant):
@@ -289,14 +274,30 @@ async def my_agent(ctx: JobContext):
             asyncio.create_task(send_to_ccm(call_id, customer_id, item.text_content, "BOT"))
     
     # Start session
+    assistant = Assistant(call_id, customer_id)
+    
     await session.start(
-        agent=Assistant(call_id, customer_id),
+        agent=assistant,
         room=ctx.room,
     )
     
     await ctx.connect()
     
     logger.info(f"✅ AGENT CONNECTED TO ROOM: {call_id}")
+    
+    # ========================================================================
+    # SEND WELCOME GREETING IMMEDIATELY
+    # ========================================================================
+    welcome_message = "Welcome to Expertflow Support, let me know how I can help you?"
+    logger.info(f"🎙️ Sending welcome greeting immediately")
+    
+    # Send to CCM
+    await send_to_ccm(call_id, customer_id, welcome_message, "BOT")
+    
+    # Speak the greeting
+    await session.say(welcome_message, allow_interruptions=True)
+    
+    logger.info(f"✅ Welcome greeting sent")
 
 # ============================================================================
 # RUN SERVER

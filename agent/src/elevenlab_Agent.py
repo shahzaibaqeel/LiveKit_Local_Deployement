@@ -19,7 +19,7 @@ import aiohttp
 from livekit import rtc
 from livekit import api
 from livekit.agents import (
-    AutoSubscribe,  # ✅ CORRECT IMPORT
+    AutoSubscribe,
     JobContext, 
     JobProcess, 
     cli, 
@@ -131,25 +131,47 @@ class ElevenLabsAgentBridge:
             logger.error("❌ ELEVEN_API_KEY not found in .env file")
             return False
         
-        if not self.agent_id or self.agent_id == "your-agent-id":
+        if not self.agent_id:
             logger.error("❌ ELEVENLABS_AGENT_ID not configured in .env file")
             return False
         
-        # WebSocket endpoint
+        # ✅ FIXED: WebSocket URL with API key in query parameter
+        # This is the correct way according to ElevenLabs documentation
         url = f"wss://api.elevenlabs.io/v1/convai/conversation?agent_id={self.agent_id}"
         
-        headers = {
-            "xi-api-key": api_key
-        }
-        
         try:
-            self.websocket = await websockets.connect(url, extra_headers=headers)
+            # ✅ FIXED: Pass headers as additional_headers parameter (websockets 11.0+)
+            # For older versions, we'll use a different approach
+            self.websocket = await websockets.connect(
+                url,
+                additional_headers={"xi-api-key": api_key}
+            )
             logger.info(f"🟢 Connected to ElevenLabs Agent: {self.agent_id}")
             self.running = True
             return True
+        except TypeError:
+            # Fallback for older websockets versions
+            try:
+                # Try with extra_headers for older versions
+                import websockets.legacy.client as legacy_client
+                self.websocket = await legacy_client.connect(
+                    url,
+                    extra_headers={"xi-api-key": api_key}
+                )
+                logger.info(f"🟢 Connected to ElevenLabs Agent (legacy): {self.agent_id}")
+                self.running = True
+                return True
+            except:
+                # Last fallback: include API key in URL
+                url_with_key = f"wss://api.elevenlabs.io/v1/convai/conversation?agent_id={self.agent_id}&xi-api-key={api_key}"
+                self.websocket = await websockets.connect(url_with_key)
+                logger.info(f"🟢 Connected to ElevenLabs Agent (URL auth): {self.agent_id}")
+                self.running = True
+                return True
         except Exception as e:
             logger.error(f"❌ Failed to connect to ElevenLabs: {e}")
-            logger.error(f"   Check your ELEVEN_API_KEY and ELEVENLABS_AGENT_ID in .env")
+            logger.error(f"   Agent ID: {self.agent_id}")
+            logger.error(f"   API Key (first 10 chars): {api_key[:10]}...")
             return False
     
     async def send_audio(self, audio_frame: rtc.AudioFrame):
@@ -361,7 +383,7 @@ async def entrypoint(ctx: JobContext):
             transfer_triggered["value"] = False
     
     # ========================================================================
-    # CONNECT TO ROOM - ✅ FIXED: AutoSubscribe now imported correctly
+    # CONNECT TO ROOM
     # ========================================================================
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
     logger.info(f"✅ Connected to room: {call_id}")

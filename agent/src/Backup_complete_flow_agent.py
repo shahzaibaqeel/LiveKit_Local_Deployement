@@ -261,7 +261,9 @@ async def my_agent(ctx: JobContext):
         agent=Assistant(call_id, customer_id),
         room=ctx.room,
     )
-    
+    # 🔊 WELCOME PROMPT
+    await session.say("Welcome to Expertflow Support, let me know how I can help you?")
+
     await ctx.connect()
     
     logger.info(f"✅ AGENT CONNECTED TO ROOM: {call_id}")

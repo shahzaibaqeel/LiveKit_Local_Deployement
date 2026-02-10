@@ -401,23 +401,7 @@ async def entrypoint(ctx: JobContext):
     if not await elevenlabs_bridge.connect():
         logger.error("❌ Failed to connect to ElevenLabs - check your credentials")
         return
-    # Initiate conversation so ElevenLabs starts sending audio
-async def initiate_conversation():
-    try:
-        init_msg = {
-            "type": "conversation_initiation_client_data",
-            "conversation_initiation_client_data": {
-                "conversation_config_override": {}
-            }
-        }
-        await elevenlabs_bridge.websocket.send(json.dumps(init_msg))
-        logger.info("✅ Sent conversation initiation to ElevenLabs")
-    except Exception as e:
-        logger.error(f"❌ Failed to initiate conversation: {e}")
-
-# Call the async function
-await initiate_conversation()
-
+    
 
 
 

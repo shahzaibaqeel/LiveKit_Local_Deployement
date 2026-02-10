@@ -1,7 +1,7 @@
 """
 ============================================================================
 LIVEKIT AGENT WITH OPENAI REALTIME API + CALL TRANSFER TO HUMAN AGENT
-WITH IMMEDIATE GREETING - PRODUCTION READY
+WITH IMMEDIATE GREETING - PRODUCTION READY - FIXED
 ============================================================================
 """
 
@@ -21,6 +21,7 @@ from livekit.agents import (
     JobContext,
     JobProcess,
     cli,
+    llm,
 )
 from livekit.plugins import silero
 from livekit.plugins import openai
@@ -93,18 +94,46 @@ async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type:
         logger.error(f"CCM error: {e}", exc_info=True)
 
 # ============================================================================
-# AGENT DEFINITION
+# AGENT DEFINITION WITH IMMEDIATE GREETING
 # ============================================================================
 class Assistant(Agent):
     def __init__(self, call_id: str, customer_id: str) -> None:
-        super().__init__(
-            instructions="""You are a helpful voice AI assistant for Expertflow Support.
+        # Create initial chat context with system message
+        initial_ctx = llm.ChatContext().append(
+            role="system",
+            text="""You are a helpful voice AI assistant for Expertflow Support.
 
 When a customer asks to speak with a human agent or mentions "transfer", "agent", 
-"representative", "human", "connect me", say "Let me connect you with our team" then STOP speaking.""",
+"representative", "human", "connect me", say "Let me connect you with our team" then STOP speaking."""
+        )
+        
+        # Add the greeting as the first assistant message
+        initial_ctx.append(
+            role="assistant",
+            text="Welcome to Expertflow Support, let me know how I can help you?"
+        )
+        
+        super().__init__(
+            chat_ctx=initial_ctx,
         )
         self.call_id = call_id
         self.customer_id = customer_id
+        self.greeting_sent = False
+    
+    async def on_enter(self):
+        """Called when agent enters the session - Send immediate greeting"""
+        logger.info(f"AGENT ON_ENTER CALLED - Sending greeting")
+        
+        welcome_msg = "Welcome to Expertflow Support, let me know how I can help you?"
+        
+        # Send to CCM
+        await send_to_ccm(self.call_id, self.customer_id, welcome_msg, "BOT")
+        
+        # THIS IS THE KEY: generate_reply() triggers the agent to speak
+        self.session.generate_reply()
+        
+        self.greeting_sent = True
+        logger.info(f"GREETING INITIATED VIA generate_reply()")
 
 # ============================================================================
 # SERVER SETUP
@@ -144,7 +173,6 @@ async def my_agent(ctx: JobContext):
     
     transfer_triggered = {"value": False}
     session_ref = {"session": None}
-    greeting_sent = {"value": False}
     
     # ========================================================================
     # TRANSFER FUNCTION
@@ -199,33 +227,6 @@ async def my_agent(ctx: JobContext):
             await send_to_ccm(call_id, customer_id, "Transfer failed. Please try again.", "BOT")
     
     # ========================================================================
-    # SEND GREETING FUNCTION
-    # ========================================================================
-    async def send_greeting():
-        """Send initial greeting to customer"""
-        if greeting_sent["value"]:
-            logger.info("Greeting already sent, skipping")
-            return
-        
-        greeting_sent["value"] = True
-        welcome_msg = "Welcome to Expertflow Support, let me know how I can help you?"
-        
-        logger.info(f"SENDING INITIAL GREETING: {welcome_msg}")
-        
-        # Send to CCM first
-        await send_to_ccm(call_id, customer_id, welcome_msg, "BOT")
-        
-        # Then speak it
-        if session_ref["session"]:
-            try:
-                await session_ref["session"].say(welcome_msg, allow_interruptions=True)
-                logger.info(f"GREETING SPOKEN SUCCESSFULLY")
-            except Exception as e:
-                logger.error(f"Error speaking greeting: {e}")
-        else:
-            logger.error("Session not available for greeting")
-    
-    # ========================================================================
     # ROOM EVENTS
     # ========================================================================
     @ctx.room.on("participant_connected")
@@ -257,11 +258,6 @@ async def my_agent(ctx: JobContext):
         if customer_id == "unknown" and participant.identity.startswith("sip_"):
             customer_id = participant.identity.replace("sip_", "")
             logger.info(f"CUSTOMER IDENTIFIED FROM TRACK: {customer_id} (from {participant.identity})")
-        
-        # Send greeting when first audio track is subscribed
-        if track.kind == rtc.TrackKind.KIND_AUDIO and not greeting_sent["value"]:
-            logger.info(f"Audio track subscribed - scheduling greeting")
-            asyncio.create_task(send_greeting())
     
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant):
@@ -287,20 +283,6 @@ async def my_agent(ctx: JobContext):
     )
     
     session_ref["session"] = session
-    
-    # ========================================================================
-    # SESSION STARTED EVENT - SEND GREETING HERE
-    # ========================================================================
-    @session.on("session_started")
-    def on_session_started():
-        """Called when OpenAI session is fully started"""
-        logger.info(f"SESSION STARTED - Triggering greeting in 2 seconds")
-        
-        async def delayed_greeting():
-            await asyncio.sleep(2)  # Wait 2 seconds for everything to be ready
-            await send_greeting()
-        
-        asyncio.create_task(delayed_greeting())
     
     # ========================================================================
     # USER INPUT TRANSCRIBED EVENT - CORRECT EVENT FOR REALTIME API

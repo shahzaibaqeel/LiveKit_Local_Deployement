@@ -125,6 +125,8 @@ async def my_agent(ctx: JobContext):
     logger.info(f"🔵 NEW CALL: Room={call_id}, Customer={customer_id}")
     
     transfer_triggered = {"value": False}
+    session_ref = {"session": None}
+    greeting_sent = {"value": False}
     
     # ========================================================================
     # TRANSFER FUNCTION
@@ -185,11 +187,39 @@ async def my_agent(ctx: JobContext):
     def on_participant_connected(participant: rtc.RemoteParticipant):
         logger.info(f"👤 JOINED: {participant.identity}, Kind: {participant.kind}, SID: {participant.sid}")
         if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
-            logger.info(f"🟢 HUMAN AGENT CONNECTED TO ROOM")
+            logger.info(f"🟢 HUMAN AGENT CONNECTED - AI AGENT WILL NOW LEAVE")
+            
+            async def leave_room():
+                try:
+                    await asyncio.sleep(1)
+                    logger.info("🤖 Stopping AI agent session...")
+                    if session_ref["session"]:
+                        await session_ref["session"].aclose()
+                    logger.info("🤖 AI agent leaving room...")
+                    await ctx.disconnect()
+                    logger.info("✅ AI agent left - Customer now talking to human agent")
+                except Exception as e:
+                    logger.error(f"❌ Error leaving room: {e}")
+            
+            asyncio.create_task(leave_room())
     
     @ctx.room.on("track_subscribed")
     def on_track_subscribed(track: rtc.Track, publication: rtc.TrackPublication, participant: rtc.RemoteParticipant):
         logger.info(f"🎧 TRACK: {participant.identity} - {track.kind}")
+        
+        # Send greeting when audio track is ready
+        if track.kind == rtc.TrackKind.KIND_AUDIO and not greeting_sent["value"]:
+            greeting_sent["value"] = True
+            
+            async def send_greeting():
+                await asyncio.sleep(1)
+                welcome_msg = "Welcome to Expertflow Support, let me know how I can help you?"
+                logger.info(f"🎙️ Sending welcome greeting")
+                await send_to_ccm(call_id, customer_id, welcome_msg, "BOT")
+                if session_ref["session"]:
+                    await session_ref["session"].say(welcome_msg, allow_interruptions=True)
+            
+            asyncio.create_task(send_greeting())
     
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant):
@@ -213,6 +243,8 @@ async def my_agent(ctx: JobContext):
         ),
         vad=ctx.proc.userdata["vad"],
     )
+    
+    session_ref["session"] = session
     
     # ========================================================================
     # USER INPUT TRANSCRIBED EVENT - CORRECT EVENT FOR REALTIME API

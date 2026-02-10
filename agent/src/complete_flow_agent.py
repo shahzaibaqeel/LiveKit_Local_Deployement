@@ -72,7 +72,7 @@ async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type:
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "https://efcx4-voice.expertflow.com/ccm",
+                "https://efcx4-voice.expertflow.com/ccm/message/receive",
                 json=payload,
                 headers={"Content-Type": "application/json"},
                 timeout=aiohttp.ClientTimeout(total=10)

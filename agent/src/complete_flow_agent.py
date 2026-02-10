@@ -21,11 +21,10 @@ from livekit.agents import (
     JobContext,
     JobProcess,
     cli,
-    stt,
+    transcription,
 )
 from livekit.plugins import silero
 from livekit.plugins import openai
-from livekit.plugins import deepgram
 
 # Load environment variables
 current_dir = Path(__file__).parent
@@ -124,49 +123,6 @@ async def my_agent(ctx: JobContext):
     
     transfer_triggered = {"value": False}
     human_agent_joined = {"value": False}
-    transcription_task = {"task": None}
-    
-    # ========================================================================
-    # CONTINUOUS TRANSCRIPTION AFTER TRANSFER
-    # ========================================================================
-    async def start_continuous_transcription():
-        """Start transcribing customer audio after human agent joins"""
-        logger.info("🎤 Starting continuous transcription for human agent view")
-        
-        try:
-            # Find customer audio track
-            customer_track = None
-            for participant in ctx.room.remote_participants.values():
-                if participant.kind != rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
-                    for track_pub in participant.track_publications.values():
-                        if track_pub.track and track_pub.track.kind == rtc.TrackKind.KIND_AUDIO:
-                            customer_track = track_pub.track
-                            logger.info(f"✅ Found customer audio track: {participant.identity}")
-                            break
-                if customer_track:
-                    break
-            
-            if not customer_track:
-                logger.warning("⚠️ No customer audio track found")
-                return
-            
-            # Create STT stream using Deepgram
-            stt_stream = stt.StreamAdapter(
-                stt=deepgram.STT(model="nova-2"),
-                vad=ctx.proc.userdata["vad"]
-            )
-            
-            audio_stream = rtc.AudioStream(customer_track)
-            
-            async for event in stt_stream.stream():
-                if event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
-                    text = event.alternatives[0].text.strip()
-                    if text:
-                        logger.info(f"👤 CUSTOMER (post-transfer): {text}")
-                        await send_to_ccm(call_id, customer_id, text, "CONNECTOR")
-                        
-        except Exception as e:
-            logger.error(f"❌ Transcription error: {e}")
     
     # ========================================================================
     # TRANSFER FUNCTION
@@ -229,8 +185,6 @@ async def my_agent(ctx: JobContext):
         if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
             logger.info(f"🟢 HUMAN AGENT CONNECTED TO ROOM")
             human_agent_joined["value"] = True
-            # Start continuous transcription
-            transcription_task["task"] = asyncio.create_task(start_continuous_transcription())
     
     @ctx.room.on("track_subscribed")
     def on_track_subscribed(track: rtc.Track, publication: rtc.TrackPublication, participant: rtc.RemoteParticipant):
@@ -239,10 +193,29 @@ async def my_agent(ctx: JobContext):
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant):
         logger.info(f"👋 LEFT: {participant.identity}")
-        if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
-            # Cancel transcription task if running
-            if transcription_task["task"]:
-                transcription_task["task"].cancel()
+    
+    # ========================================================================
+    # ROOM TRANSCRIPTION HANDLER - For continuous transcription
+    # ========================================================================
+    @ctx.room.on("transcription_received")
+    def on_transcription_received(transcription_event: transcription.Transcription):
+        """Handle transcriptions from all participants"""
+        for segment in transcription_event.segments:
+            text = segment.text.strip()
+            participant_identity = transcription_event.participant_identity
+            
+            if not text:
+                continue
+                
+            logger.info(f"📝 TRANSCRIPTION [{participant_identity}]: {text}")
+            
+            # Send to CCM based on who's speaking
+            if human_agent_joined["value"]:
+                # After human joins, customer speech goes as CONNECTOR
+                asyncio.create_task(send_to_ccm(call_id, customer_id, text, "CONNECTOR"))
+            else:
+                # Before human joins, customer speech also goes as CONNECTOR
+                asyncio.create_task(send_to_ccm(call_id, customer_id, text, "CONNECTOR"))
     
     # ========================================================================
     # OPENAI REALTIME SESSION
@@ -285,13 +258,14 @@ async def my_agent(ctx: JobContext):
         # Send to CCM
         asyncio.create_task(send_to_ccm(call_id, customer_id, transcript, "CONNECTOR"))
         
-        # Check for transfer keywords
-        transfer_keywords = ["transfer", "human", "agent", "representative", "person", "someone"]
-        if any(keyword in transcript.lower() for keyword in transfer_keywords):
-            logger.info(f"🔍 TRANSFER KEYWORD DETECTED: '{transcript}'")
-            logger.info(f"🚀 TRIGGERING TRANSFER...")
-            # Execute transfer
-            asyncio.create_task(execute_transfer())
+        # Check for transfer keywords - only if human hasn't joined yet
+        if not human_agent_joined["value"]:
+            transfer_keywords = ["transfer", "human", "agent", "representative", "person", "someone"]
+            if any(keyword in transcript.lower() for keyword in transfer_keywords):
+                logger.info(f"🔍 TRANSFER KEYWORD DETECTED: '{transcript}'")
+                logger.info(f"🚀 TRIGGERING TRANSFER...")
+                # Execute transfer
+                asyncio.create_task(execute_transfer())
     
     # ========================================================================
     # CONVERSATION ITEM ADDED - FOR AGENT RESPONSES

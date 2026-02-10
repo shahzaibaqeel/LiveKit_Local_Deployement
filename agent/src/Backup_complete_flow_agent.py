@@ -115,7 +115,7 @@ server.setup_fnc = prewarm
 # ============================================================================
 # MAIN AGENT HANDLER
 # ============================================================================
-@server.rtc_session(agent_name="")
+@server.rtc_session(agent_name="production agent")
 async def my_agent(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
     

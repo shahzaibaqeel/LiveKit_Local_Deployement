@@ -401,11 +401,7 @@ async def entrypoint(ctx: JobContext):
     if not await elevenlabs_bridge.connect():
         logger.error("❌ Failed to connect to ElevenLabs - check your credentials")
         return
-    
-
-
-
-    
+        
     # ========================================================================
     # AUDIO STREAMING FROM LIVEKIT TO ELEVENLABS
     # ========================================================================

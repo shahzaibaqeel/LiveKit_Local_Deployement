@@ -18,7 +18,13 @@ from dotenv import load_dotenv
 import aiohttp
 from livekit import rtc
 from livekit import api
-from livekit.agents import JobContext, JobProcess, cli, WorkerOptions
+from livekit.agents import (
+    AutoSubscribe,  # ✅ CORRECT IMPORT
+    JobContext, 
+    JobProcess, 
+    cli, 
+    WorkerOptions
+)
 
 # Load environment variables
 current_dir = Path(__file__).parent
@@ -174,8 +180,6 @@ class ElevenLabsAgentBridge:
     
     async def receive_events(self, audio_source: rtc.AudioSource):
         """Receive events from ElevenLabs and stream to LiveKit"""
-        audio_buffer = []
-        
         try:
             while self.running:
                 message = await self.websocket.recv()
@@ -261,8 +265,6 @@ class ElevenLabsAgentBridge:
                 # ============================================================
                 elif event_type == "interruption":
                     logger.info(f"⚡ User interrupted agent")
-                    # Clear audio buffer if needed
-                    audio_buffer.clear()
                 
                 # ============================================================
                 # PING (keep-alive)
@@ -359,9 +361,9 @@ async def entrypoint(ctx: JobContext):
             transfer_triggered["value"] = False
     
     # ========================================================================
-    # CONNECT TO ROOM
+    # CONNECT TO ROOM - ✅ FIXED: AutoSubscribe now imported correctly
     # ========================================================================
-    await ctx.connect(auto_subscribe=rtc.AutoSubscribe.AUDIO_ONLY)
+    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
     logger.info(f"✅ Connected to room: {call_id}")
     
     # Create audio source for ElevenLabs output (16kHz mono)

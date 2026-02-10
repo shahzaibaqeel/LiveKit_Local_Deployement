@@ -93,7 +93,7 @@ async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type:
         logger.error(f"CCM error: {e}", exc_info=True)
 
 # ============================================================================
-# AGENT DEFINITION WITH IMMEDIATE GREETING
+# AGENT DEFINITION
 # ============================================================================
 class Assistant(Agent):
     def __init__(self, call_id: str, customer_id: str) -> None:
@@ -105,22 +105,6 @@ When a customer asks to speak with a human agent or mentions "transfer", "agent"
         )
         self.call_id = call_id
         self.customer_id = customer_id
-        self.greeting_sent = False
-    
-    async def on_enter(self):
-        """Called when agent enters the session - Send immediate greeting"""
-        if not self.greeting_sent:
-            self.greeting_sent = True
-            welcome_msg = "Welcome to Expertflow Support, let me know how I can help you?"
-            
-            logger.info(f"Agent entered - Sending immediate greeting")
-            
-            # Send to CCM first
-            await send_to_ccm(self.call_id, self.customer_id, welcome_msg, "BOT")
-            
-            # Then speak it
-            await self.session.say(welcome_msg, allow_interruptions=True)
-            logger.info(f"Greeting sent successfully")
 
 # ============================================================================
 # SERVER SETUP
@@ -143,10 +127,24 @@ async def my_agent(ctx: JobContext):
     call_id = ctx.room.name
     customer_id = ctx.room.metadata if ctx.room.metadata else "unknown"
     
-    logger.info(f"NEW CALL: Room={call_id}, Customer={customer_id}")
+    logger.info(f"NEW CALL: Room={call_id}, Initial Customer={customer_id}")
+    
+    # Check for existing participants to extract customer_id
+    logger.info(f"Checking for existing participants in room...")
+    for participant in ctx.room.remote_participants.values():
+        if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
+            identity = participant.identity
+            if identity.startswith("sip_"):
+                customer_id = identity.replace("sip_", "")
+                logger.info(f"CUSTOMER IDENTIFIED FROM EXISTING PARTICIPANT: {customer_id}")
+                break
+    
+    if customer_id == "unknown":
+        logger.warning(f"Customer ID still unknown after checking existing participants")
     
     transfer_triggered = {"value": False}
     session_ref = {"session": None}
+    greeting_sent = {"value": False}
     
     # ========================================================================
     # TRANSFER FUNCTION
@@ -201,6 +199,33 @@ async def my_agent(ctx: JobContext):
             await send_to_ccm(call_id, customer_id, "Transfer failed. Please try again.", "BOT")
     
     # ========================================================================
+    # SEND GREETING FUNCTION
+    # ========================================================================
+    async def send_greeting():
+        """Send initial greeting to customer"""
+        if greeting_sent["value"]:
+            logger.info("Greeting already sent, skipping")
+            return
+        
+        greeting_sent["value"] = True
+        welcome_msg = "Welcome to Expertflow Support, let me know how I can help you?"
+        
+        logger.info(f"SENDING INITIAL GREETING: {welcome_msg}")
+        
+        # Send to CCM first
+        await send_to_ccm(call_id, customer_id, welcome_msg, "BOT")
+        
+        # Then speak it
+        if session_ref["session"]:
+            try:
+                await session_ref["session"].say(welcome_msg, allow_interruptions=True)
+                logger.info(f"GREETING SPOKEN SUCCESSFULLY")
+            except Exception as e:
+                logger.error(f"Error speaking greeting: {e}")
+        else:
+            logger.error("Session not available for greeting")
+    
+    # ========================================================================
     # ROOM EVENTS
     # ========================================================================
     @ctx.room.on("participant_connected")
@@ -225,7 +250,18 @@ async def my_agent(ctx: JobContext):
     
     @ctx.room.on("track_subscribed")
     def on_track_subscribed(track: rtc.Track, publication: rtc.TrackPublication, participant: rtc.RemoteParticipant):
-        logger.info(f"TRACK SUBSCRIBED: {participant.identity} - {track.kind}")
+        logger.info(f"TRACK: {participant.identity} - {track.kind}")
+        
+        # Extract customer ID from participant identity if still unknown
+        nonlocal customer_id
+        if customer_id == "unknown" and participant.identity.startswith("sip_"):
+            customer_id = participant.identity.replace("sip_", "")
+            logger.info(f"CUSTOMER IDENTIFIED FROM TRACK: {customer_id} (from {participant.identity})")
+        
+        # Send greeting when first audio track is subscribed
+        if track.kind == rtc.TrackKind.KIND_AUDIO and not greeting_sent["value"]:
+            logger.info(f"Audio track subscribed - scheduling greeting")
+            asyncio.create_task(send_greeting())
     
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant):
@@ -251,6 +287,20 @@ async def my_agent(ctx: JobContext):
     )
     
     session_ref["session"] = session
+    
+    # ========================================================================
+    # SESSION STARTED EVENT - SEND GREETING HERE
+    # ========================================================================
+    @session.on("session_started")
+    def on_session_started():
+        """Called when OpenAI session is fully started"""
+        logger.info(f"SESSION STARTED - Triggering greeting in 2 seconds")
+        
+        async def delayed_greeting():
+            await asyncio.sleep(2)  # Wait 2 seconds for everything to be ready
+            await send_greeting()
+        
+        asyncio.create_task(delayed_greeting())
     
     # ========================================================================
     # USER INPUT TRANSCRIBED EVENT - CORRECT EVENT FOR REALTIME API
@@ -305,7 +355,6 @@ async def my_agent(ctx: JobContext):
     await ctx.connect()
     
     logger.info(f"AGENT CONNECTED TO ROOM: {call_id}")
-    logger.info(f"Greeting will be sent automatically via on_enter()")
 
 # ============================================================================
 # RUN SERVER

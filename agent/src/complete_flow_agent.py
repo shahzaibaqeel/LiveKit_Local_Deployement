@@ -44,7 +44,7 @@ async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type:
         "id": call_id,
         "header": {
             "channelData": {
-                "channelCustomerIdentifier": 1002,
+                "channelCustomerIdentifier": customer_id,
                 "serviceIdentifier": "682200",
                 "channelTypeCode": "CX_VOICE"
             },

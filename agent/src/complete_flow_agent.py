@@ -1,7 +1,7 @@
 """
 ============================================================================
-LIVEKIT AGENT WITH OPENAI REALTIME API + CALL TRANSFER TO HUMAN AGENT
-WITH IMMEDIATE GREETING - WORKING VERSION
+LIVEKIT AGENT WITH OPENAI REALTIME API + CALL TRANSFER + DISCONNECT HANDLING
+COMPLETE PRODUCTION READY VERSION
 ============================================================================
 """
 
@@ -145,6 +145,62 @@ async def my_agent(ctx: JobContext):
     transfer_triggered = {"value": False}
     session_ref = {"session": None}
     greeting_sent = {"value": False}
+    human_agent_sid = {"value": None}
+    customer_sid = {"value": None}
+    
+    # ========================================================================
+    # DISCONNECT ENTIRE CALL
+    # ========================================================================
+    async def disconnect_call(reason: str):
+        """Disconnect all participants and end the call"""
+        logger.info(f"DISCONNECTING CALL - Reason: {reason}")
+        
+        try:
+            # Close session
+            if session_ref["session"]:
+                await session_ref["session"].aclose()
+                logger.info("Session closed")
+            
+            # Disconnect agent
+            await ctx.disconnect()
+            logger.info("Agent disconnected")
+            
+            # If there's a human agent, disconnect them too
+            if human_agent_sid["value"]:
+                try:
+                    livekit_api = api.LiveKitAPI(
+                        url=os.getenv("LIVEKIT_URL"),
+                        api_key=os.getenv("LIVEKIT_API_KEY"),
+                        api_secret=os.getenv("LIVEKIT_API_SECRET")
+                    )
+                    await livekit_api.room.remove_participant(
+                        room=call_id,
+                        identity=human_agent_sid["value"]
+                    )
+                    logger.info(f"Removed human agent: {human_agent_sid['value']}")
+                except Exception as e:
+                    logger.error(f"Error removing human agent: {e}")
+            
+            # If there's a customer, disconnect them
+            if customer_sid["value"]:
+                try:
+                    livekit_api = api.LiveKitAPI(
+                        url=os.getenv("LIVEKIT_URL"),
+                        api_key=os.getenv("LIVEKIT_API_KEY"),
+                        api_secret=os.getenv("LIVEKIT_API_SECRET")
+                    )
+                    await livekit_api.room.remove_participant(
+                        room=call_id,
+                        identity=customer_sid["value"]
+                    )
+                    logger.info(f"Removed customer: {customer_sid['value']}")
+                except Exception as e:
+                    logger.error(f"Error removing customer: {e}")
+            
+            logger.info(f"CALL FULLY DISCONNECTED")
+            
+        except Exception as e:
+            logger.error(f"Error in disconnect_call: {e}", exc_info=True)
     
     # ========================================================================
     # TRANSFER FUNCTION
@@ -204,8 +260,17 @@ async def my_agent(ctx: JobContext):
     @ctx.room.on("participant_connected")
     def on_participant_connected(participant: rtc.RemoteParticipant):
         logger.info(f"JOINED: {participant.identity}, Kind: {participant.kind}, SID: {participant.sid}")
-        if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
+        
+        # Track customer SID
+        if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP and participant.identity.startswith("sip_"):
+            customer_sid["value"] = participant.identity
+            logger.info(f"Tracked customer SID: {customer_sid['value']}")
+        
+        # Human agent connected
+        if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP and participant.identity.startswith("human-agent"):
+            human_agent_sid["value"] = participant.identity
             logger.info(f"HUMAN AGENT CONNECTED - AI AGENT WILL NOW LEAVE")
+            logger.info(f"Tracked human agent SID: {human_agent_sid['value']}")
             
             async def leave_room():
                 try:
@@ -234,25 +299,27 @@ async def my_agent(ctx: JobContext):
         # TRIGGER GREETING WHEN AUDIO TRACK IS READY
         if track.kind == rtc.TrackKind.KIND_AUDIO and not greeting_sent["value"]:
             greeting_sent["value"] = True
-            logger.info(f"AUDIO TRACK READY - Triggering greeting in 1 second")
+            logger.info(f"AUDIO TRACK READY - Scheduling greeting")
             
             async def send_greeting_delayed():
-                await asyncio.sleep(1)  # Wait for everything to be ready
+                await asyncio.sleep(2)  # Wait for session to be fully ready
                 
                 welcome_msg = "Welcome to Expertflow Support, let me know how I can help you?"
-                logger.info(f"SENDING GREETING: {welcome_msg}")
+                logger.info(f"SENDING GREETING VIA generate_reply()")
                 
                 # Send to CCM
                 await send_to_ccm(call_id, customer_id, welcome_msg, "BOT")
                 
-                # Speak using session.say()
+                # Use generate_reply with instructions (correct method for Realtime API)
                 if session_ref["session"]:
                     try:
-                        logger.info(f"Calling session.say()...")
-                        await session_ref["session"].say(welcome_msg, allow_interruptions=True)
-                        logger.info(f"GREETING SENT SUCCESSFULLY")
+                        logger.info(f"Calling session.session.generate_reply()...")
+                        session_ref["session"].session.generate_reply(
+                            instructions=f"Say exactly: '{welcome_msg}'"
+                        )
+                        logger.info(f"GREETING TRIGGERED SUCCESSFULLY")
                     except Exception as e:
-                        logger.error(f"Error in session.say(): {e}", exc_info=True)
+                        logger.error(f"Error in generate_reply(): {e}", exc_info=True)
                 else:
                     logger.error(f"Session not available yet!")
             
@@ -260,7 +327,17 @@ async def my_agent(ctx: JobContext):
     
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant):
-        logger.info(f"LEFT: {participant.identity}")
+        logger.info(f"LEFT: {participant.identity}, Kind: {participant.kind}")
+        
+        # If customer disconnects, end the entire call
+        if participant.identity == customer_sid["value"]:
+            logger.info(f"CUSTOMER DISCONNECTED - Ending entire call")
+            asyncio.create_task(disconnect_call("Customer disconnected"))
+        
+        # If human agent disconnects (and customer still there), end call
+        elif participant.identity == human_agent_sid["value"]:
+            logger.info(f"HUMAN AGENT DISCONNECTED - Ending call")
+            asyncio.create_task(disconnect_call("Human agent disconnected"))
     
     # ========================================================================
     # OPENAI REALTIME SESSION

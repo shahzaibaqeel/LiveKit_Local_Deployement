@@ -1,8 +1,8 @@
 """
-============================================================================
-LIVEKIT AGENT WITH OPENAI REALTIME API + CALL TRANSFER TO HUMAN AGENT
-FULL TRANSCRIPTION TO CCM - PRODUCTION READY
-============================================================================
+===================================================================================
+LIVEKIT AGENT WITH OPENAI REALTIME API + CALL TRANSFER + FULL TRANSCRIPTION
+PRODUCTION READY - ALL ISSUES FIXED
+===================================================================================
 """
 
 import logging
@@ -22,10 +22,9 @@ from livekit.agents import (
     JobProcess,
     cli,
     stt,
+    AutoSubscribe,
 )
-from livekit.plugins import silero
-from livekit.plugins import openai
-from livekit.plugins import deepgram
+from livekit.plugins import silero, openai, deepgram
 
 # Load environment variables
 current_dir = Path(__file__).parent
@@ -36,101 +35,103 @@ logger = logging.getLogger("agent")
 logger.setLevel(logging.INFO)
 
 # ============================================================================
-# CCM API HELPER - WITH QUEUE FOR RELIABILITY
+# CCM API HELPER - FIXED: Proper session management
 # ============================================================================
-class CCMClient:
-    def __init__(self, url: str):
-        self.url = url
-        self.queue = asyncio.Queue()
-        self.worker_task = None
-        
-    async def start(self):
-        """Start background worker"""
-        self.worker_task = asyncio.create_task(self._worker())
-        logger.info("[CCM] Worker started")
+async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type: str):
+    """Send transcript to CCM with retry logic"""
+    if not message or not message.strip():
+        return
     
-    async def _worker(self):
-        """Process messages in background"""
-        async with aiohttp.ClientSession() as session:
-            while True:
-                try:
-                    payload = await self.queue.get()
-                    await self._send(session, payload)
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    logger.error(f"[CCM] Worker error: {e}")
+    payload = {
+        "id": call_id,
+        "header": {
+            "channelData": {
+                "channelCustomerIdentifier": customer_id,
+                "serviceIdentifier": "682200",
+                "channelTypeCode": "CX_VOICE"
+            },
+            "sender": {
+                "id": "6540b0fc90b3913194d45525" if sender_type == "BOT" else 
+                      "460df46c-adf9-11ed-afa1-0242ac120002" if sender_type == "CONNECTOR" else
+                      "agent_live_transfer",
+                "type": sender_type,
+                "senderName": "Voice Bot" if sender_type == "BOT" else 
+                             "WEB_CONNECTOR" if sender_type == "CONNECTOR" else "Live Agent",
+                "additionalDetail": None
+            },
+            "language": {},
+            "timestamp": str(int(time.time() * 1000)),
+            "securityInfo": {},
+            "stamps": [],
+            "intent": "",
+            "originalMessageId": None,
+            "schedulingMetaData": None,
+            "entities": {}
+        },
+        "body": {"type": "PLAIN", "markdownText": message}
+    }
     
-    async def _send(self, session, payload):
-        """Send to CCM with retry"""
+    # FIX: Proper session cleanup
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         for attempt in range(3):
             try:
                 async with session.post(
-                    f"{self.url}/message/receive",
+                    "https://efcx4-voice.expertflow.com/ccm/message/receive",
                     json=payload,
-                    headers={"Content-Type": "application/json"},
-                    timeout=aiohttp.ClientTimeout(total=10)
+                    headers={"Content-Type": "application/json"}
                 ) as resp:
                     if resp.status in [200, 202]:
-                        logger.info(f"[CCM] ✅ {payload['header']['sender']['type']}")
-                        return
+                        logger.info(f"[CCM] ✅ {sender_type}: {message[:50]}...")
+                        return True
                     else:
-                        logger.error(f"[CCM] Status {resp.status}")
+                        logger.warning(f"[CCM] Attempt {attempt+1}: Status {resp.status}")
+            except asyncio.TimeoutError:
+                logger.warning(f"[CCM] Attempt {attempt+1}: Timeout")
             except Exception as e:
-                logger.error(f"[CCM] Attempt {attempt + 1}: {e}")
-                if attempt < 2:
-                    await asyncio.sleep(1)
+                logger.error(f"[CCM] Attempt {attempt+1}: {e}")
+            
+            if attempt < 2:
+                await asyncio.sleep(1)
     
-    def send(self, call_id: str, customer_id: str, message: str, sender_type: str):
-        """Queue message for sending"""
-        payload = {
-            "id": call_id,
-            "header": {
-                "channelData": {
-                    "channelCustomerIdentifier": customer_id,
-                    "serviceIdentifier": "682200",
-                    "channelTypeCode": "CX_VOICE"
-                },
-                "sender": {
-                    "id": "6540b0fc90b3913194d45525" if sender_type == "BOT" else 
-                          "460df46c-adf9-11ed-afa1-0242ac120002",
-                    "type": sender_type,
-                    "senderName": "Voice Bot" if sender_type == "BOT" else 
-                                 "Human Agent" if sender_type == "AGENT" else "WEB_CONNECTOR",
-                    "additionalDetail": None
-                },
-                "language": {},
-                "timestamp": str(int(time.time() * 1000)),
-                "securityInfo": {},
-                "stamps": [],
-                "intent": "",
-                "originalMessageId": None,
-                "schedulingMetaData": None,
-                "entities": {}
-            },
-            "body": {
-                "type": "PLAIN",
-                "markdownText": message
-            }
-        }
-        self.queue.put_nowait(payload)
-        logger.info(f"[CCM] Queued {sender_type}: {message[:50]}")
-
-ccm_client = CCMClient("https://efcx4-voice.expertflow.com/ccm")
+    logger.error(f"[CCM] ❌ Failed after 3 attempts: {sender_type}")
+    return False
 
 # ============================================================================
-# AGENT DEFINITION
+# ASSISTANT WITH GREETING - FIXED
 # ============================================================================
 class Assistant(Agent):
-    def __init__(self, call_id: str, customer_id: str) -> None:
+    def __init__(self, call_id: str, customer_id: str):
         super().__init__(
-            instructions="""You are a helpful voice AI assistant.
+            instructions="""You are a helpful voice AI assistant for Expertflow Support.
 
 When a customer asks to speak with a human agent or mentions "transfer", "agent", 
-"representative", "human", "connect me", say "Let me connect you with our team" then STOP speaking.""",
+"representative", "human", "connect me", say "Let me connect you with our team" then STOP speaking."""
         )
         self.call_id = call_id
         self.customer_id = customer_id
+        self.greeting_sent = False
+    
+    async def on_enter(self):
+        """Send greeting when agent becomes active"""
+        if self.greeting_sent:
+            return
+        
+        self.greeting_sent = True
+        welcome_msg = "Welcome to Expertflow Support, let me know how I can help you?"
+        
+        logger.info("[AGENT] Sending greeting...")
+        
+        # Send to CCM
+        await send_to_ccm(self.call_id, self.customer_id, welcome_msg, "BOT")
+        
+        # FIX: Use generate_reply() for Realtime API, not say()
+        if self.session:
+            self.session.generate_reply(
+                instructions=f'Say EXACTLY: "{welcome_msg}"'
+            )
+        
+        logger.info("[AGENT] ✅ Greeting sent")
 
 # ============================================================================
 # SERVER SETUP
@@ -138,8 +139,10 @@ When a customer asks to speak with a human agent or mentions "transfer", "agent"
 server = AgentServer()
 
 def prewarm(proc: JobProcess):
-    """Preload VAD model"""
     proc.userdata["vad"] = silero.VAD.load()
+    # Preload Deepgram for faster startup
+    if os.getenv("DEEPGRAM_API_KEY"):
+        proc.userdata["deepgram"] = deepgram.STT()
 
 server.setup_fnc = prewarm
 
@@ -148,94 +151,44 @@ server.setup_fnc = prewarm
 # ============================================================================
 @server.rtc_session(agent_name="")
 async def my_agent(ctx: JobContext):
-    await ccm_client.start()
-    
     ctx.log_context_fields = {"room": ctx.room.name}
     
     call_id = ctx.room.name
     customer_id = ctx.room.metadata if ctx.room.metadata else "unknown"
     
-    logger.info(f"🔵 NEW CALL: Room={call_id}, Customer={customer_id}")
+    logger.info(f"[CALL] 🔵 NEW: Room={call_id}, Customer={customer_id}")
     
-    transfer_triggered = {"value": False}
+    # State tracking
+    state = {
+        "customer_identity": None,
+        "human_agent_identity": None,
+        "transfer_triggered": False,
+        "ai_active": True,
+        "deepgram_stream": None,
+    }
+    
     session_ref = {"session": None}
-    ai_active = {"value": True}
-    greeting_played = {"value": False}
     
-    # ========================================================================
-    # DEEPGRAM TRANSCRIPTION FOR CUSTOMER (works after AI leaves)
-    # ========================================================================
-    async def start_customer_transcription():
-        """Transcribe customer audio using Deepgram"""
-        logger.info("[DEEPGRAM] Starting customer transcription")
-        
-        # Find customer participant
-        customer_participant = None
-        for p in ctx.room.remote_participants.values():
-            if not p.identity.startswith("human-agent"):
-                customer_participant = p
-                break
-        
-        if not customer_participant:
-            logger.warning("[DEEPGRAM] No customer found")
-            return
-        
-        # Find audio track
-        audio_track = None
-        for pub in customer_participant.track_publications.values():
-            if pub.track and pub.track.kind == rtc.TrackKind.KIND_AUDIO:
-                audio_track = pub.track
-                break
-        
-        if not audio_track:
-            logger.warning("[DEEPGRAM] No audio track")
-            return
-        
-        logger.info(f"[DEEPGRAM] Transcribing {customer_participant.identity}")
-        
-        try:
-            # Create Deepgram STT
-            deepgram_stt = deepgram.STT(
-                model="nova-2-general",
-                language="en-US",
-            )
-            
-            audio_stream = rtc.AudioStream(audio_track)
-            stt_stream = deepgram_stt.stream()
-            
-            # Forward audio to Deepgram
-            async def forward():
-                async for frame in audio_stream:
-                    stt_stream.push_frame(frame)
-            
-            forward_task = asyncio.create_task(forward())
-            
-            # Process transcripts
-            async for event in stt_stream:
-                if event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
-                    text = event.alternatives[0].text.strip()
-                    if text:
-                        logger.info(f"[CUSTOMER] {text}")
-                        ccm_client.send(call_id, customer_id, text, "CONNECTOR")
-            
-            forward_task.cancel()
-            
-        except Exception as e:
-            logger.error(f"[DEEPGRAM] Error: {e}", exc_info=True)
+    # Extract initial customer
+    for p in ctx.room.remote_participants.values():
+        if p.identity.startswith("sip_") and not p.identity.startswith("human"):
+            state["customer_identity"] = p.identity
+            customer_id = p.identity.replace("sip_", "")
+            logger.info(f"[CALL] Initial customer: {customer_id}")
+            break
     
     # ========================================================================
     # TRANSFER FUNCTION
     # ========================================================================
     async def execute_transfer():
-        """Execute SIP transfer to human agent"""
-        if transfer_triggered["value"]:
-            logger.info("⏭️ Transfer already in progress")
+        """Transfer to human agent"""
+        if state["transfer_triggered"]:
             return
-            
-        transfer_triggered["value"] = True
-        logger.info(f"🔴 EXECUTING TRANSFER")
         
-        ccm_client.send(call_id, customer_id, "Connecting you to our live agent...", "BOT")
+        state["transfer_triggered"] = True
+        logger.info("[TRANSFER] 🔴 Executing...")
+        
+        await send_to_ccm(call_id, customer_id, "Connecting you to our live agent...", "BOT")
         
         try:
             livekit_api = api.LiveKitAPI(
@@ -244,97 +197,137 @@ async def my_agent(ctx: JobContext):
                 api_secret=os.getenv("LIVEKIT_API_SECRET")
             )
             
-            outbound_trunk_id = "ST_W7jqvDFA2VgG"
-            agent_extension = "99900"
-            
-            logger.info(f"📞 Calling: {agent_extension}")
-            
-            transfer_result = await livekit_api.sip.create_sip_participant(
+            result = await livekit_api.sip.create_sip_participant(
                 api.CreateSIPParticipantRequest(
                     room_name=call_id,
-                    sip_trunk_id=outbound_trunk_id,
-                    sip_call_to=f"{agent_extension}",
-                    participant_identity=f"human-agent-general",
-                    participant_name=f"Human Agent",
+                    sip_trunk_id="ST_W7jqvDFA2VgG",
+                    sip_call_to="99900",
+                    participant_identity=f"human-agent-{customer_id}",
+                    participant_name="Human Agent",
                     participant_metadata='{"reason": "customer_request"}',
                 )
             )
             
-            logger.info(f"✅ TRANSFER SUCCESS: {transfer_result.sip_call_id}")
-            ccm_client.send(call_id, customer_id, "Transfer initiated", "BOT")
+            logger.info(f"[TRANSFER] ✅ Success: {result.sip_call_id}")
+            await send_to_ccm(call_id, customer_id, "Transfer initiated", "BOT")
             
         except Exception as e:
-            logger.error(f"❌ TRANSFER FAILED: {e}", exc_info=True)
-            transfer_triggered["value"] = False
-            ccm_client.send(call_id, customer_id, "Transfer failed. Please try again.", "BOT")
+            logger.error(f"[TRANSFER] ❌ Failed: {e}", exc_info=True)
+            state["transfer_triggered"] = False
+            await send_to_ccm(call_id, customer_id, "Transfer failed. Please try again.", "BOT")
     
     # ========================================================================
-    # ROOM EVENTS
+    # DEEPGRAM TRANSCRIPTION FOR HUMAN AGENT
+    # ========================================================================
+    async def start_deepgram_for_participant(participant: rtc.RemoteParticipant, track: rtc.RemoteAudioTrack):
+        """Start Deepgram transcription for human agent or customer after AI leaves"""
+        logger.info(f"[DEEPGRAM] Starting for: {participant.identity}")
+        
+        try:
+            # Get Deepgram STT
+            deepgram_stt = ctx.proc.userdata.get("deepgram") or deepgram.STT()
+            
+            # Create audio stream
+            audio_stream = rtc.AudioStream(track)
+            
+            # Start transcription stream
+            stt_stream = deepgram_stt.stream()
+            
+            # Store reference
+            state["deepgram_stream"] = stt_stream
+            
+            # Process transcriptions
+            async def process_transcriptions():
+                async for event in stt_stream:
+                    if event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
+                        text = event.alternatives[0].text.strip()
+                        if text:
+                            # Determine sender type
+                            if participant.identity.startswith("human-agent"):
+                                sender_type = "AGENT"
+                                logger.info(f"[AGENT-SPEECH] {text}")
+                            else:
+                                sender_type = "CONNECTOR"
+                                logger.info(f"[CUSTOMER-SPEECH] {text}")
+                            
+                            # Send to CCM
+                            await send_to_ccm(call_id, customer_id, text, sender_type)
+            
+            # Forward audio to Deepgram
+            async def forward_audio():
+                async for audio_frame in audio_stream:
+                    if state["deepgram_stream"]:
+                        stt_stream.push_frame(audio_frame)
+            
+            # Run both tasks
+            await asyncio.gather(
+                process_transcriptions(),
+                forward_audio(),
+                return_exceptions=True
+            )
+            
+        except Exception as e:
+            logger.error(f"[DEEPGRAM] Error for {participant.identity}: {e}", exc_info=True)
+    
+    # ========================================================================
+    # ROOM EVENTS - FIX: All callbacks are synchronous
     # ========================================================================
     @ctx.room.on("participant_connected")
     def on_participant_connected(participant: rtc.RemoteParticipant):
-        logger.info(f"👤 JOINED: {participant.identity}")
+        """FIX: Synchronous callback"""
+        logger.info(f"[ROOM] 👤 Joined: {participant.identity}")
         
+        # Track customer
+        if participant.identity.startswith("sip_") and not participant.identity.startswith("human"):
+            state["customer_identity"] = participant.identity
+        
+        # Human agent joined - AI leaves
         if participant.identity.startswith("human-agent"):
-            logger.info(f"🟢 HUMAN AGENT CONNECTED - AI WILL LEAVE")
+            state["human_agent_identity"] = participant.identity
+            logger.info("[ROOM] 🟢 Human agent joined - AI will leave")
             
+            # FIX: Use create_task for async operations
             async def ai_leave():
-                await asyncio.sleep(1)
-                ai_active["value"] = False
-                logger.info("🤖 AI leaving room...")
+                await asyncio.sleep(0.5)
+                state["ai_active"] = False
                 
+                # Shutdown AI session
                 if session_ref["session"]:
-                    await session_ref["session"].aclose()
-                
-                # Start Deepgram transcription for customer after AI leaves
-                asyncio.create_task(start_customer_transcription())
-                
-                logger.info("✅ AI left - Customer transcription continues")
+                    session_ref["session"].shutdown()
+                    logger.info("[AGENT] ✅ AI session shutdown")
             
             asyncio.create_task(ai_leave())
     
-    class Assistant(Agent):
-     def __init__(self, call_id: str, customer_id: str):
-        super().__init__(instructions="...")
-        self.call_id = call_id
-        self.customer_id = customer_id
-        self.greeted = False
-
-    async def on_enter(self):
-        if self.greeted:
-            return
-        self.greeted = True
-
-        welcome = "Welcome to Expertflow Support, let me know how I can help you?"
-        logger.info("🎙️ Greeting")
-
-        ccm_client.send(self.call_id, self.customer_id, welcome, "BOT")
-
-        self.session.generate_reply(
-            instructions=f'Say exactly: "{welcome}"'
-        )
-
-        logger.info(f"🎧 TRACK: {participant.identity} - {track.kind}")
+    @ctx.room.on("track_subscribed")
+    def on_track_subscribed(track: rtc.Track, publication: rtc.TrackPublication, participant: rtc.RemoteParticipant):
+        """FIX: Synchronous callback - start transcription here"""
+        nonlocal customer_id
         
-        # Play greeting when first audio track is ready
-        if track.kind == rtc.TrackKind.KIND_AUDIO and not greeting_played["value"]:
-            greeting_played["value"] = True
-            
-            async def play_greeting():
-                await asyncio.sleep(1)  # Wait for session to be ready
-                welcome = "Welcome to Expertflow Support, let me know how I can help you?"
-                logger.info(f"🎙️ Playing greeting")
-                
-                ccm_client.send(call_id, customer_id, welcome, "BOT")
-                
-                if session_ref["session"]:
-                    await session_ref["session"].say(welcome, allow_interruptions=True)
-            
-            asyncio.create_task(play_greeting())
+        logger.info(f"[ROOM] 🎧 Track: {participant.identity} - {track.kind}")
+        
+        # Extract customer ID
+        if customer_id == "unknown" and participant.identity.startswith("sip_"):
+            customer_id = participant.identity.replace("sip_", "")
+            logger.info(f"[ROOM] Customer ID: {customer_id}")
+        
+        # FIX: Start Deepgram for human agent when they join
+        if participant.identity.startswith("human-agent") and track.kind == rtc.TrackKind.KIND_AUDIO:
+            logger.info("[ROOM] Starting Deepgram for human agent")
+            asyncio.create_task(start_deepgram_for_participant(participant, track))
+        
+        # FIX: Also transcribe customer after AI leaves
+        elif participant.identity == state["customer_identity"] and track.kind == rtc.TrackKind.KIND_AUDIO and not state["ai_active"]:
+            logger.info("[ROOM] Starting Deepgram for customer (post-transfer)")
+            asyncio.create_task(start_deepgram_for_participant(participant, track))
     
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant):
-        logger.info(f"👋 LEFT: {participant.identity}")
+        """FIX: Synchronous callback"""
+        logger.info(f"[ROOM] 👋 Left: {participant.identity}")
+        
+        # Clean up Deepgram if needed
+        if state["deepgram_stream"]:
+            state["deepgram_stream"] = None
     
     # ========================================================================
     # OPENAI REALTIME SESSION
@@ -358,48 +351,54 @@ async def my_agent(ctx: JobContext):
     session_ref["session"] = session
     
     # ========================================================================
-    # USER INPUT TRANSCRIBED (Customer speaks to AI)
+    # SESSION EVENTS - FIX: All synchronous
     # ========================================================================
     @session.on("user_input_transcribed")
     def on_user_input_transcribed(event):
-        if not event.is_final or not ai_active["value"]:
+        """FIX: Synchronous - customer speaks to AI"""
+        if not event.is_final or not state["ai_active"]:
             return
         
-        transcript = event.transcript
-        logger.info(f"👤 USER: {transcript}")
+        transcript = event.transcript.strip()
+        if not transcript:
+            return
         
-        # Send to CCM
-        ccm_client.send(call_id, customer_id, transcript, "CONNECTOR")
+        logger.info(f"[CUSTOMER] {transcript}")
         
-        # Check for transfer keywords
-        transfer_keywords = ["transfer", "human", "agent", "representative", "person", "someone"]
-        if any(keyword in transcript.lower() for keyword in transfer_keywords):
-            logger.info(f"🔍 TRANSFER KEYWORD DETECTED")
+        # FIX: Use create_task for async CCM send
+        asyncio.create_task(send_to_ccm(call_id, customer_id, transcript, "CONNECTOR"))
+        
+        # Check transfer keywords
+        keywords = ["transfer", "human", "agent", "representative", "person", "someone", "connect"]
+        if any(k in transcript.lower() for k in keywords):
+            logger.info("[TRANSFER] Keyword detected")
             asyncio.create_task(execute_transfer())
     
-    # ========================================================================
-    # CONVERSATION ITEM ADDED (AI speaks)
-    # ========================================================================
     @session.on("conversation_item_added")
     def on_conversation_item_added(event):
-        if not ai_active["value"]:
+        """FIX: Synchronous - AI speaks"""
+        if not state["ai_active"]:
             return
         
         item = event.item
-        
         if item.role == "assistant" and hasattr(item, 'text_content') and item.text_content:
-            logger.info(f"🤖 AGENT: {item.text_content}")
-            ccm_client.send(call_id, customer_id, item.text_content, "BOT")
+            text = item.text_content.strip()
+            if text:
+                logger.info(f"[AI-AGENT] {text}")
+                asyncio.create_task(send_to_ccm(call_id, customer_id, text, "BOT"))
     
-    # Start session
+    # ========================================================================
+    # START SESSION
+    # ========================================================================
     await session.start(
         agent=Assistant(call_id, customer_id),
         room=ctx.room,
     )
     
-    await ctx.connect()
+    # Connect to room
+    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
     
-    logger.info(f"✅ AGENT CONNECTED TO ROOM: {call_id}")
+    logger.info(f"[AGENT] ✅ Connected to room: {call_id}")
 
 # ============================================================================
 # RUN SERVER

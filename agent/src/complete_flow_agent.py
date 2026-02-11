@@ -1,8 +1,8 @@
 """
-============================================================================
-LIVEKIT AGENT WITH OPENAI REALTIME API + CALL TRANSFER + DISCONNECT HANDLING
-COMPLETE PRODUCTION READY VERSION
-============================================================================
+===================================================================================
+LIVEKIT AGENT WITH OPENAI REALTIME API + CALL TRANSFER + FULL TRANSCRIPTION
+Based on Jambonz working implementation - PRODUCTION READY
+===================================================================================
 """
 
 import logging
@@ -37,8 +37,8 @@ logger.setLevel(logging.INFO)
 # CCM API HELPER
 # ============================================================================
 async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type: str):
-    """Send transcript to CCM API"""
-    logger.info(f"Sending to CCM - Type: {sender_type}, Message: {message[:50]}...")
+    """Send transcript to CCM API - Matches Jambonz implementation"""
+    logger.info(f"[CCM] Sending {sender_type} message: {message[:50]}...")
     
     payload = {
         "id": call_id,
@@ -50,10 +50,11 @@ async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type:
             },
             "sender": {
                 "id": "6540b0fc90b3913194d45525" if sender_type == "BOT" else 
-                      "460df46c-adf9-11ed-afa1-0242ac120002",
+                      "460df46c-adf9-11ed-afa1-0242ac120002" if sender_type == "CONNECTOR" else
+                      "agent_live_transfer",
                 "type": sender_type,
                 "senderName": "Voice Bot" if sender_type == "BOT" else 
-                             "Human Agent" if sender_type == "AGENT" else "WEB_CONNECTOR",
+                             "WEB_CONNECTOR" if sender_type == "CONNECTOR" else "Live Agent",
                 "additionalDetail": None
             },
             "language": {},
@@ -80,20 +81,14 @@ async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type:
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
                 if resp.status == 200:
-                    logger.info(f"CCM sent successfully: {sender_type}")
-                    response_text = await resp.text()
-                    logger.info(f"CCM Response: {response_text[:100]}")
+                    logger.info(f"[CCM] ✅ Sent successfully: {sender_type}")
                 else:
-                    logger.error(f"CCM failed with status: {resp.status}")
-                    error_text = await resp.text()
-                    logger.error(f"Error details: {error_text}")
-    except asyncio.TimeoutError:
-        logger.error(f"CCM timeout after 10 seconds")
+                    logger.error(f"[CCM] ❌ Failed with status: {resp.status}")
     except Exception as e:
-        logger.error(f"CCM error: {e}", exc_info=True)
+        logger.error(f"[CCM] ❌ Error: {e}")
 
 # ============================================================================
-# AGENT DEFINITION
+# AGENT DEFINITION WITH GREETING
 # ============================================================================
 class Assistant(Agent):
     def __init__(self, call_id: str, customer_id: str) -> None:
@@ -105,6 +100,27 @@ When a customer asks to speak with a human agent or mentions "transfer", "agent"
         )
         self.call_id = call_id
         self.customer_id = customer_id
+        self.greeting_sent = False
+    
+    async def on_enter(self):
+        """Called when agent enters session - Send immediate greeting"""
+        if self.greeting_sent:
+            return
+        
+        self.greeting_sent = True
+        welcome_msg = "Welcome to Expertflow Support, let me know how I can help you?"
+        
+        logger.info(f"[AGENT] on_enter() called - Sending greeting")
+        
+        # Send to CCM first
+        await send_to_ccm(self.call_id, self.customer_id, welcome_msg, "BOT")
+        
+        # Trigger agent to speak using generateReply()
+        self.session.generate_reply(
+            instructions=f"Say exactly: '{welcome_msg}'"
+        )
+        
+        logger.info(f"[AGENT] ✅ Greeting initiated via generate_reply()")
 
 # ============================================================================
 # SERVER SETUP
@@ -127,80 +143,55 @@ async def my_agent(ctx: JobContext):
     call_id = ctx.room.name
     customer_id = ctx.room.metadata if ctx.room.metadata else "unknown"
     
-    logger.info(f"NEW CALL: Room={call_id}, Initial Customer={customer_id}")
+    logger.info(f"[CALL] 🔵 NEW CALL: Room={call_id}, Customer={customer_id}")
     
-    # Check for existing participants to extract customer_id
-    logger.info(f"Checking for existing participants in room...")
-    for participant in ctx.room.remote_participants.values():
-        if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
-            identity = participant.identity
-            if identity.startswith("sip_"):
-                customer_id = identity.replace("sip_", "")
-                logger.info(f"CUSTOMER IDENTIFIED FROM EXISTING PARTICIPANT: {customer_id}")
-                break
-    
-    if customer_id == "unknown":
-        logger.warning(f"Customer ID still unknown after checking existing participants")
-    
+    # Track participants
+    customer_identity = {"value": None}
+    human_agent_identity = {"value": None}
     transfer_triggered = {"value": False}
     session_ref = {"session": None}
-    greeting_sent = {"value": False}
-    human_agent_sid = {"value": None}
-    customer_sid = {"value": None}
+    ai_agent_active = {"value": True}
     
     # ========================================================================
     # DISCONNECT ENTIRE CALL
     # ========================================================================
     async def disconnect_call(reason: str):
         """Disconnect all participants and end the call"""
-        logger.info(f"DISCONNECTING CALL - Reason: {reason}")
+        logger.info(f"[CALL] 🔴 Disconnecting - Reason: {reason}")
         
         try:
-            # Close session
+            livekit_api = api.LiveKitAPI(
+                url=os.getenv("LIVEKIT_URL"),
+                api_key=os.getenv("LIVEKIT_API_KEY"),
+                api_secret=os.getenv("LIVEKIT_API_SECRET")
+            )
+            
+            # Remove all participants
+            participants_to_remove = []
+            if customer_identity["value"]:
+                participants_to_remove.append(customer_identity["value"])
+            if human_agent_identity["value"]:
+                participants_to_remove.append(human_agent_identity["value"])
+            
+            for identity in participants_to_remove:
+                try:
+                    await livekit_api.room.remove_participant(
+                        room=call_id,
+                        identity=identity
+                    )
+                    logger.info(f"[CALL] ✅ Removed participant: {identity}")
+                except Exception as e:
+                    logger.error(f"[CALL] ❌ Error removing {identity}: {e}")
+            
+            # Close session and disconnect agent
             if session_ref["session"]:
                 await session_ref["session"].aclose()
-                logger.info("Session closed")
-            
-            # Disconnect agent
             await ctx.disconnect()
-            logger.info("Agent disconnected")
             
-            # If there's a human agent, disconnect them too
-            if human_agent_sid["value"]:
-                try:
-                    livekit_api = api.LiveKitAPI(
-                        url=os.getenv("LIVEKIT_URL"),
-                        api_key=os.getenv("LIVEKIT_API_KEY"),
-                        api_secret=os.getenv("LIVEKIT_API_SECRET")
-                    )
-                    await livekit_api.room.remove_participant(
-                        room=call_id,
-                        identity=human_agent_sid["value"]
-                    )
-                    logger.info(f"Removed human agent: {human_agent_sid['value']}")
-                except Exception as e:
-                    logger.error(f"Error removing human agent: {e}")
-            
-            # If there's a customer, disconnect them
-            if customer_sid["value"]:
-                try:
-                    livekit_api = api.LiveKitAPI(
-                        url=os.getenv("LIVEKIT_URL"),
-                        api_key=os.getenv("LIVEKIT_API_KEY"),
-                        api_secret=os.getenv("LIVEKIT_API_SECRET")
-                    )
-                    await livekit_api.room.remove_participant(
-                        room=call_id,
-                        identity=customer_sid["value"]
-                    )
-                    logger.info(f"Removed customer: {customer_sid['value']}")
-                except Exception as e:
-                    logger.error(f"Error removing customer: {e}")
-            
-            logger.info(f"CALL FULLY DISCONNECTED")
+            logger.info(f"[CALL] ✅ Call fully disconnected")
             
         except Exception as e:
-            logger.error(f"Error in disconnect_call: {e}", exc_info=True)
+            logger.error(f"[CALL] ❌ Error in disconnect_call: {e}", exc_info=True)
     
     # ========================================================================
     # TRANSFER FUNCTION
@@ -208,11 +199,11 @@ async def my_agent(ctx: JobContext):
     async def execute_transfer():
         """Execute SIP transfer to human agent"""
         if transfer_triggered["value"]:
-            logger.info("Transfer already in progress, skipping")
+            logger.info("[TRANSFER] ⏭️ Transfer already in progress")
             return
             
         transfer_triggered["value"] = True
-        logger.info(f"EXECUTING TRANSFER NOW")
+        logger.info(f"[TRANSFER] 🔴 EXECUTING TRANSFER NOW")
         
         await send_to_ccm(call_id, customer_id, "Connecting you to our live agent...", "BOT")
         
@@ -225,32 +216,27 @@ async def my_agent(ctx: JobContext):
             
             outbound_trunk_id = "ST_W7jqvDFA2VgG"
             agent_extension = "99900"
-            fusionpbx_ip = "192.168.2.24"
             
-            logger.info(f"Calling: sip:{agent_extension}@{fusionpbx_ip}:5060")
-            logger.info(f"Using trunk: {outbound_trunk_id}")
-            logger.info(f"Room: {call_id}")
+            logger.info(f"[TRANSFER] 📞 Calling: {agent_extension}")
             
             transfer_result = await livekit_api.sip.create_sip_participant(
                 api.CreateSIPParticipantRequest(
                     room_name=call_id,
                     sip_trunk_id=outbound_trunk_id,
                     sip_call_to=f"{agent_extension}",
-                    participant_identity=f"human-agent-general",
+                    participant_identity=f"human-agent-{customer_id}",
                     participant_name=f"Human Agent",
                     participant_metadata='{"reason": "customer_request"}',
                 )
             )
             
-            logger.info(f"TRANSFER SUCCESS!")
-            logger.info(f"Participant ID: {transfer_result.participant_id}")
-            logger.info(f"Participant Identity: {transfer_result.participant_identity}")
-            logger.info(f"SIP Call ID: {transfer_result.sip_call_id}")
+            logger.info(f"[TRANSFER] ✅ SUCCESS!")
+            logger.info(f"[TRANSFER] SIP Call ID: {transfer_result.sip_call_id}")
             
             await send_to_ccm(call_id, customer_id, "Transfer initiated", "BOT")
             
         except Exception as e:
-            logger.error(f"TRANSFER FAILED: {e}", exc_info=True)
+            logger.error(f"[TRANSFER] ❌ FAILED: {e}", exc_info=True)
             transfer_triggered["value"] = False
             await send_to_ccm(call_id, customer_id, "Transfer failed. Please try again.", "BOT")
     
@@ -259,84 +245,56 @@ async def my_agent(ctx: JobContext):
     # ========================================================================
     @ctx.room.on("participant_connected")
     def on_participant_connected(participant: rtc.RemoteParticipant):
-        logger.info(f"JOINED: {participant.identity}, Kind: {participant.kind}, SID: {participant.sid}")
+        logger.info(f"[ROOM] 👤 JOINED: {participant.identity}, Kind: {participant.kind}")
         
-        # Track customer SID
+        # Track customer
         if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP and participant.identity.startswith("sip_"):
-            customer_sid["value"] = participant.identity
-            logger.info(f"Tracked customer SID: {customer_sid['value']}")
+            customer_identity["value"] = participant.identity
+            logger.info(f"[ROOM] 📞 Customer tracked: {customer_identity['value']}")
         
         # Human agent connected
         if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP and participant.identity.startswith("human-agent"):
-            human_agent_sid["value"] = participant.identity
-            logger.info(f"HUMAN AGENT CONNECTED - AI AGENT WILL NOW LEAVE")
-            logger.info(f"Tracked human agent SID: {human_agent_sid['value']}")
+            human_agent_identity["value"] = participant.identity
+            logger.info(f"[ROOM] 🟢 HUMAN AGENT CONNECTED")
+            logger.info(f"[ROOM] Tracked human agent: {human_agent_identity['value']}")
             
-            async def leave_room():
+            # AI agent leaves
+            async def ai_agent_leave():
                 try:
                     await asyncio.sleep(1)
-                    logger.info("Stopping AI agent session...")
+                    ai_agent_active["value"] = False
+                    logger.info("[AGENT] 🤖 AI agent stopping...")
                     if session_ref["session"]:
                         await session_ref["session"].aclose()
-                    logger.info("AI agent leaving room...")
                     await ctx.disconnect()
-                    logger.info("AI agent left - Customer now talking to human agent")
+                    logger.info("[AGENT] ✅ AI agent left - Customer now with human agent")
                 except Exception as e:
-                    logger.error(f"Error leaving room: {e}")
+                    logger.error(f"[AGENT] ❌ Error leaving: {e}")
             
-            asyncio.create_task(leave_room())
+            asyncio.create_task(ai_agent_leave())
     
     @ctx.room.on("track_subscribed")
     def on_track_subscribed(track: rtc.Track, publication: rtc.TrackPublication, participant: rtc.RemoteParticipant):
-        logger.info(f"TRACK: {participant.identity} - {track.kind}")
+        logger.info(f"[ROOM] 🎧 TRACK: {participant.identity} - {track.kind}")
         
-        # Extract customer ID from participant identity if still unknown
+        # Extract customer ID if still unknown
         nonlocal customer_id
         if customer_id == "unknown" and participant.identity.startswith("sip_"):
             customer_id = participant.identity.replace("sip_", "")
-            logger.info(f"CUSTOMER IDENTIFIED FROM TRACK: {customer_id} (from {participant.identity})")
-        
-        # TRIGGER GREETING WHEN AUDIO TRACK IS READY
-        if track.kind == rtc.TrackKind.KIND_AUDIO and not greeting_sent["value"]:
-            greeting_sent["value"] = True
-            logger.info(f"AUDIO TRACK READY - Scheduling greeting")
-            
-            async def send_greeting_delayed():
-                await asyncio.sleep(2)  # Wait for session to be fully ready
-                
-                welcome_msg = "Welcome to Expertflow Support, let me know how I can help you?"
-                logger.info(f"SENDING GREETING VIA generate_reply()")
-                
-                # Send to CCM
-                await send_to_ccm(call_id, customer_id, welcome_msg, "BOT")
-                
-                # Use generate_reply with instructions (correct method for Realtime API)
-                if session_ref["session"]:
-                    try:
-                        logger.info(f"Calling session.session.generate_reply()...")
-                        session_ref["session"].session.generate_reply(
-                            instructions=f"Say exactly: '{welcome_msg}'"
-                        )
-                        logger.info(f"GREETING TRIGGERED SUCCESSFULLY")
-                    except Exception as e:
-                        logger.error(f"Error in generate_reply(): {e}", exc_info=True)
-                else:
-                    logger.error(f"Session not available yet!")
-            
-            asyncio.create_task(send_greeting_delayed())
+            logger.info(f"[ROOM] 📞 Customer ID identified: {customer_id}")
     
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant):
-        logger.info(f"LEFT: {participant.identity}, Kind: {participant.kind}")
+        logger.info(f"[ROOM] 👋 LEFT: {participant.identity}")
         
-        # If customer disconnects, end the entire call
-        if participant.identity == customer_sid["value"]:
-            logger.info(f"CUSTOMER DISCONNECTED - Ending entire call")
+        # Customer disconnected - end call
+        if participant.identity == customer_identity["value"]:
+            logger.info(f"[ROOM] 🔴 Customer disconnected - Ending call")
             asyncio.create_task(disconnect_call("Customer disconnected"))
         
-        # If human agent disconnects (and customer still there), end call
-        elif participant.identity == human_agent_sid["value"]:
-            logger.info(f"HUMAN AGENT DISCONNECTED - Ending call")
+        # Human agent disconnected - end call
+        elif participant.identity == human_agent_identity["value"]:
+            logger.info(f"[ROOM] 🔴 Human agent disconnected - Ending call")
             asyncio.create_task(disconnect_call("Human agent disconnected"))
     
     # ========================================================================
@@ -361,47 +319,46 @@ async def my_agent(ctx: JobContext):
     session_ref["session"] = session
     
     # ========================================================================
-    # USER INPUT TRANSCRIBED EVENT
+    # USER INPUT TRANSCRIBED - CUSTOMER SPEAKS
     # ========================================================================
     @session.on("user_input_transcribed")
     def on_user_input_transcribed(event):
-        """
-        This is the CORRECT event for OpenAI Realtime API
-        """
+        """Customer speech transcription"""
         transcript = event.transcript
         is_final = event.is_final
         
-        logger.info(f"USER TRANSCRIPT (final={is_final}): {transcript}")
+        logger.info(f"[USER] 👤 Transcript (final={is_final}): {transcript}")
         
-        # Only process final transcripts
-        if not is_final:
+        if not is_final or not ai_agent_active["value"]:
             return
         
         # Send to CCM
-        logger.info(f"Sending user transcript to CCM: {transcript}")
         asyncio.create_task(send_to_ccm(call_id, customer_id, transcript, "CONNECTOR"))
         
         # Check for transfer keywords
         transfer_keywords = ["transfer", "human", "agent", "representative", "person", "someone"]
         if any(keyword in transcript.lower() for keyword in transfer_keywords):
-            logger.info(f"TRANSFER KEYWORD DETECTED: '{transcript}'")
-            logger.info(f"TRIGGERING TRANSFER...")
+            logger.info(f"[TRANSFER] 🔍 Keyword detected: '{transcript}'")
             asyncio.create_task(execute_transfer())
     
     # ========================================================================
-    # CONVERSATION ITEM ADDED - FOR AGENT RESPONSES
+    # CONVERSATION ITEM ADDED - AI AGENT SPEAKS
     # ========================================================================
     @session.on("conversation_item_added")
     def on_conversation_item_added(event):
-        """Capture agent responses"""
+        """AI agent response"""
         item = event.item
         
         if item.role == "assistant" and hasattr(item, 'text_content') and item.text_content:
-            logger.info(f"AGENT RESPONSE: {item.text_content}")
-            logger.info(f"Sending agent response to CCM: {item.text_content}")
+            if not ai_agent_active["value"]:
+                return
+            
+            logger.info(f"[AGENT] 🤖 Response: {item.text_content}")
             asyncio.create_task(send_to_ccm(call_id, customer_id, item.text_content, "BOT"))
     
-    # Start session
+    # ========================================================================
+    # START SESSION
+    # ========================================================================
     await session.start(
         agent=Assistant(call_id, customer_id),
         room=ctx.room,
@@ -409,7 +366,8 @@ async def my_agent(ctx: JobContext):
     
     await ctx.connect()
     
-    logger.info(f"AGENT CONNECTED TO ROOM: {call_id}")
+    logger.info(f"[AGENT] ✅ CONNECTED TO ROOM: {call_id}")
+    logger.info(f"[AGENT] Greeting will be sent via on_enter()")
 
 # ============================================================================
 # RUN SERVER

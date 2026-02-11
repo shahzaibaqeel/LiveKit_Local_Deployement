@@ -398,9 +398,9 @@ async def my_agent(ctx: JobContext):
 # ============================================================================
 # CLEANUP
 # ============================================================================
-@server.on("shutdown")
-async def on_shutdown():
-    await ccm_client.stop()
+# @server.on("shutdown")
+# async def on_shutdown():
+#     await ccm_client.stop()
 
 # ============================================================================
 # RUN

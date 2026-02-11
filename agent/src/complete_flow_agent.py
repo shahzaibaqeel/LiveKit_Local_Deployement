@@ -1,7 +1,6 @@
 """
 ============================================================================
-LIVEKIT AGENT WITH OPENAI REALTIME API + CALL TRANSFER TO HUMAN AGENT
-FULL TRANSCRIPTION TO CCM - PRODUCTION READY
+LIVEKIT AGENT - FINAL WORKING VERSION
 ============================================================================
 """
 
@@ -23,7 +22,6 @@ from livekit.agents import (
     cli,
     stt,
     AutoSubscribe,
-    llm,
 )
 from livekit.plugins import silero, openai, deepgram
 
@@ -104,8 +102,6 @@ class Assistant(Agent):
         super().__init__(
             instructions="""You are a helpful voice AI assistant for Expertflow Support.
 
-Your FIRST message must be: "Welcome to Expertflow Support, let me know how I can help you?"
-
 When a customer asks to speak with a human agent or mentions "transfer", "agent", 
 "representative", "human", "connect me", say "Let me connect you with our team" then STOP speaking."""
         )
@@ -141,14 +137,12 @@ async def my_agent(ctx: JobContext):
         "human_agent_identity": None,
         "transfer_triggered": False,
         "ai_active": True,
-        "greeting_sent": False,
         "call_ended": False,
         "forward_task": None,
         "process_task": None,
     }
     
     session_ref = {"session": None}
-    agent_ref = {"agent": None}
     
     # ======================================================================== 
     # TRANSFER FUNCTION
@@ -213,7 +207,9 @@ async def my_agent(ctx: JobContext):
                         break
                     stt_stream.push_frame(audio_frame)
                     frame_count += 1
-                logger.info(f"[DEEPGRAM] Forwarded {frame_count} frames")
+                    if frame_count == 1:
+                        logger.info("[DEEPGRAM] First frame sent")
+                logger.info(f"[DEEPGRAM] Total frames: {frame_count}")
             
             async def process_transcripts():
                 async for event in stt_stream:
@@ -224,7 +220,6 @@ async def my_agent(ctx: JobContext):
                         if text:
                             logger.info(f"[DEEPGRAM] {text}")
                             await send_to_ccm(call_id, customer_id, text, "CONNECTOR")
-                logger.info("[DEEPGRAM] Processing stopped")
             
             state["forward_task"] = asyncio.create_task(forward_audio())
             state["process_task"] = asyncio.create_task(process_transcripts())
@@ -252,10 +247,6 @@ async def my_agent(ctx: JobContext):
             for task in [state["forward_task"], state["process_task"]]:
                 if task and not task.done():
                     task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
             
             # Shutdown AI
             if session_ref["session"]:
@@ -273,8 +264,8 @@ async def my_agent(ctx: JobContext):
                     try:
                         await livekit_api.room.remove_participant(room=call_id, identity=identity)
                         logger.info(f"[CALL] Removed: {identity}")
-                    except Exception as e:
-                        logger.debug(f"[CALL] Could not remove {identity}: {e}")
+                    except:
+                        pass
             
             logger.info("[CALL] ✅ Ended")
             
@@ -302,7 +293,7 @@ async def my_agent(ctx: JobContext):
                 state["ai_active"] = False
                 if session_ref["session"]:
                     session_ref["session"].shutdown()
-                logger.info("[AGENT] ✅ AI left")
+                logger.info("[AGENT] ✅ AI left - Deepgram continues")
             
             asyncio.create_task(ai_leave())
     
@@ -315,29 +306,13 @@ async def my_agent(ctx: JobContext):
         if customer_id == "unknown" and participant.identity.startswith("sip_"):
             customer_id = participant.identity.replace("sip_", "")
         
-        # Store customer audio track
+        # Store customer audio track for Deepgram
         if (participant.identity.startswith("sip_") and 
             not participant.identity.startswith("human") and 
             track.kind == rtc.TrackKind.KIND_AUDIO):
             state["customer_track"] = track
             logger.info("[ROOM] ✅ Customer track stored")
             asyncio.create_task(start_deepgram_transcription())
-        
-        # Send greeting using agent
-        if track.kind == rtc.TrackKind.KIND_AUDIO and not state["greeting_sent"]:
-            state["greeting_sent"] = True
-            
-            async def send_greeting():
-                await asyncio.sleep(1.5)
-                welcome = "Welcome to Expertflow Support, let me know how I can help you?"
-                logger.info("[GREETING] Sending...")
-                await send_to_ccm(call_id, customer_id, welcome, "BOT")
-                
-                # Use agent to speak
-                if agent_ref["agent"] and state["ai_active"]:
-                    await agent_ref["agent"].say(welcome)
-            
-            asyncio.create_task(send_greeting())
     
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant):
@@ -369,7 +344,7 @@ async def my_agent(ctx: JobContext):
     )
     session_ref["session"] = session
     
-    # AI session events
+    # AI session events (while AI is active)
     @session.on("user_input_transcribed")
     def on_user_input_transcribed(event):
         if not event.is_final or not state["ai_active"]:
@@ -403,10 +378,11 @@ async def my_agent(ctx: JobContext):
     # ======================================================================== 
     # START SESSION
     # ========================================================================
-    agent = Assistant(call_id, customer_id)
-    agent_ref["agent"] = agent
+    await session.start(
+        agent=Assistant(call_id, customer_id),
+        room=ctx.room,
+    )
     
-    await session.start(agent=agent, room=ctx.room)
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
     
     logger.info(f"[AGENT] ✅ Connected")

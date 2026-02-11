@@ -21,8 +21,8 @@ from livekit.agents import (
     JobContext,
     JobProcess,
     cli,
-    llm,
     stt,
+    llm,
 )
 from livekit.plugins import silero, openai, deepgram
 
@@ -188,7 +188,46 @@ async def my_agent(ctx: JobContext):
     transcription_started = {"value": False}
     
     # ========================================================================
-    # ROOM-LEVEL TRANSCRIPTION HANDLER (Works even after AI leaves!)
+    # TRANSCRIBE TRACK FUNCTION
+    # ========================================================================
+    async def transcribe_track(track: rtc.Track, identity: str, is_customer: bool):
+        """Transcribe a specific audio track"""
+        logger.info(f"[TRANSCRIPTION] Starting for {identity}")
+        
+        try:
+            # Create Deepgram STT
+            stt_instance = deepgram.STT(
+                model="nova-2-general",
+                language="en-US",
+            )
+            
+            # Create audio stream
+            audio_stream = rtc.AudioStream(track)
+            stt_stream = stt_instance.stream()
+            
+            # Forward audio
+            async def forward_audio():
+                async for frame in audio_stream:
+                    stt_stream.push_frame(frame)
+            
+            forward_task = asyncio.create_task(forward_audio())
+            
+            # Process transcriptions
+            async for event in stt_stream:
+                if event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
+                    text = event.alternatives[0].text.strip()
+                    if text:
+                        sender_type = "CONNECTOR" if is_customer else "AGENT"
+                        logger.info(f"[TRANSCRIPT] {sender_type}: {text}")
+                        ccm_client.send(call_id, customer_id, text, sender_type)
+            
+            forward_task.cancel()
+            
+        except Exception as e:
+            logger.error(f"[TRANSCRIPTION] Error for {identity}: {e}", exc_info=True)
+    
+    # ========================================================================
+    # ROOM-LEVEL TRANSCRIPTION HANDLER
     # ========================================================================
     async def start_room_transcription():
         """Start continuous room transcription using Deepgram"""
@@ -201,87 +240,18 @@ async def my_agent(ctx: JobContext):
         try:
             # Get all audio tracks in room
             for participant in ctx.room.remote_participants.values():
-                participant_identity = participant.identity
-                is_customer = not participant_identity.startswith("human-agent")
+                identity = participant.identity
+                is_customer = not identity.startswith("human-agent")
                 
-                logger.info(f"[TRANSCRIPTION] Subscribing to: {participant_identity}")
+                logger.info(f"[TRANSCRIPTION] Subscribing to: {identity}")
                 
                 for track_pub in participant.track_publications.values():
                     if track_pub.track and track_pub.track.kind == rtc.TrackKind.KIND_AUDIO:
                         asyncio.create_task(
-                            transcribe_track(track_pub.track, participant_identity, is_customer)
+                            transcribe_track(track_pub.track, identity, is_customer)
                         )
         except Exception as e:
             logger.error(f"[TRANSCRIPTION] Error: {e}")
-    
-    async def transcribe_track(track: rtc.Track, participant_identity: str, is_customer: bool):
-     """Transcribe a specific audio track"""
-    logger.info(f"[TRANSCRIPTION] Starting for {participant_identity}")
-    
-    try:
-        # Create Deepgram STT
-        stt_instance = deepgram.STT(
-            model="nova-2-general",
-            language="en-US",
-        )
-        
-        # Create audio stream
-        audio_stream = rtc.AudioStream(track)
-        stt_stream = stt_instance.stream()
-        
-        # Forward audio
-        async def forward_audio():
-            async for frame in audio_stream:
-                stt_stream.push_frame(frame)
-        
-        forward_task = asyncio.create_task(forward_audio())
-        
-        # Process transcriptions
-        async for event in stt_stream:
-            if event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
-                text = event.alternatives[0].text.strip()
-                if text:
-                    sender_type = "CONNECTOR" if is_customer else "AGENT"
-                    logger.info(f"[TRANSCRIPT] {sender_type}: {text}")
-                    ccm_client.send(call_id, customer_id, text, sender_type)
-        
-        forward_task.cancel()
-        
-    except Exception as e:
-        logger.error(f"[TRANSCRIPTION] Error: {e}", exc_info=True)
-        """Transcribe a specific audio track"""
-        logger.info(f"[TRANSCRIPTION] Starting for {participant_identity}")
-        
-        try:
-            # Create STT stream using Deepgram
-            stt = deepgram.STT(
-                model="nova-2-general",
-                language="en-US",
-            )
-            
-            stream = stt.stream()
-            audio_stream = rtc.AudioStream(track)
-            
-            # Forward audio to STT
-            async def forward_audio():
-                async for audio_frame in audio_stream:
-                    stream.push_frame(audio_frame)
-            
-            forward_task = asyncio.create_task(forward_audio())
-            
-            # Process transcriptions
-            async for event in stream:
-                if event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
-                    text = event.alternatives[0].text.strip()
-                    if text:
-                        sender_type = "CONNECTOR" if is_customer else "AGENT"
-                        logger.info(f"[TRANSCRIPTION] {sender_type}: {text}")
-                        ccm_client.send(call_id, customer_id, text, sender_type)
-            
-            forward_task.cancel()
-            
-        except Exception as e:
-            logger.error(f"[TRANSCRIPTION] Error for {participant_identity}: {e}")
     
     # ========================================================================
     # TRANSFER FUNCTION
@@ -382,7 +352,7 @@ async def my_agent(ctx: JobContext):
     session_ref["session"] = session
     
     # ========================================================================
-    # USER TRANSCRIPT (Customer speaks - BACKUP, room transcription is primary)
+    # USER TRANSCRIPT (Customer speaks)
     # ========================================================================
     @session.on("user_input_transcribed")
     def on_user_input_transcribed(event):
@@ -399,7 +369,7 @@ async def my_agent(ctx: JobContext):
             asyncio.create_task(execute_transfer())
     
     # ========================================================================
-    # AGENT RESPONSE (AI speaks - BACKUP, room transcription is primary)
+    # AGENT RESPONSE (AI speaks)
     # ========================================================================
     @session.on("conversation_item_added")
     def on_conversation_item_added(event):
@@ -424,18 +394,14 @@ async def my_agent(ctx: JobContext):
     
     # Send welcome greeting
     welcome_msg = "Welcome to Expertflow Support, let me know how I can help you?"
-    await session.say(welcome_msg, allow_interruptions=True)
+    session.conversation.item.create(
+        llm.ChatMessage(role="assistant", content=welcome_msg)
+    )
+    session.response.create()
     ccm_client.send(call_id, customer_id, welcome_msg, "BOT")
     
     # Start room transcription immediately
     await start_room_transcription()
-
-# ============================================================================
-# CLEANUP
-# ============================================================================
-# @server.on("shutdown")
-# async def on_shutdown():
-#     await ccm_client.stop()
 
 # ============================================================================
 # RUN

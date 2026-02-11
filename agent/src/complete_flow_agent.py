@@ -1,6 +1,6 @@
 """
 ============================================================================
-LIVEKIT AGENT - FINAL WORKING VERSION
+LIVEKIT AGENT WITH OPENAI REALTIME API + ROOM LEVEL TRANSCRIPTION + CALL HANDLING
 ============================================================================
 """
 
@@ -11,8 +11,7 @@ import asyncio
 from pathlib import Path
 from dotenv import load_dotenv
 import aiohttp
-from livekit import rtc
-from livekit import api
+from livekit import rtc, api
 from livekit.agents import (
     Agent,
     AgentServer,
@@ -20,10 +19,9 @@ from livekit.agents import (
     JobContext,
     JobProcess,
     cli,
-    stt,
     AutoSubscribe,
 )
-from livekit.plugins import silero, openai, deepgram
+from livekit.plugins import silero, openai
 
 # Load environment variables
 current_dir = Path(__file__).parent
@@ -35,7 +33,7 @@ logger.setLevel(logging.INFO)
 
 # ============================================================================ 
 # CCM API HELPER
-# ============================================================================
+# ============================================================================ 
 async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type: str):
     """Send transcript to CCM with retry logic"""
     if not message or not message.strip():
@@ -95,13 +93,12 @@ async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type:
     return False
 
 # ============================================================================ 
-# ASSISTANT
-# ============================================================================
+# ASSISTANT AGENT
+# ============================================================================ 
 class Assistant(Agent):
     def __init__(self, call_id: str, customer_id: str):
         super().__init__(
             instructions="""You are a helpful voice AI assistant for Expertflow Support.
-
 When a customer asks to speak with a human agent or mentions "transfer", "agent", 
 "representative", "human", "connect me", say "Let me connect you with our team" then STOP speaking."""
         )
@@ -110,17 +107,16 @@ When a customer asks to speak with a human agent or mentions "transfer", "agent"
 
 # ============================================================================ 
 # SERVER SETUP
-# ============================================================================
+# ============================================================================ 
 server = AgentServer()
 
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
-
 server.setup_fnc = prewarm
 
 # ============================================================================ 
 # MAIN AGENT HANDLER
-# ============================================================================
+# ============================================================================ 
 @server.rtc_session(agent_name="")
 async def my_agent(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
@@ -133,36 +129,29 @@ async def my_agent(ctx: JobContext):
     # State tracking
     state = {
         "customer_identity": None,
-        "customer_track": None,
         "human_agent_identity": None,
         "transfer_triggered": False,
         "ai_active": True,
         "call_ended": False,
-        "forward_task": None,
-        "process_task": None,
     }
     
     session_ref = {"session": None}
-    
+
     # ======================================================================== 
     # TRANSFER FUNCTION
-    # ========================================================================
+    # ======================================================================== 
     async def execute_transfer():
         if state["transfer_triggered"]:
             return
-        
         state["transfer_triggered"] = True
-        logger.info("[TRANSFER] 🔴 Executing...")
-        
+        logger.info("[TRANSFER] 🔴 Executing transfer...")
         await send_to_ccm(call_id, customer_id, "Connecting you to our live agent...", "BOT")
-        
         try:
             livekit_api = api.LiveKitAPI(
                 url=os.getenv("LIVEKIT_URL"),
                 api_key=os.getenv("LIVEKIT_API_KEY"),
                 api_secret=os.getenv("LIVEKIT_API_SECRET")
             )
-            
             result = await livekit_api.sip.create_sip_participant(
                 api.CreateSIPParticipantRequest(
                     room_name=call_id,
@@ -173,92 +162,31 @@ async def my_agent(ctx: JobContext):
                     participant_metadata='{"reason": "customer_request"}',
                 )
             )
-            
             logger.info(f"[TRANSFER] ✅ Success: {result.sip_call_id}")
             await send_to_ccm(call_id, customer_id, "Transfer initiated", "BOT")
-            
         except Exception as e:
             logger.error(f"[TRANSFER] ❌ Failed: {e}", exc_info=True)
             state["transfer_triggered"] = False
-    
-    # ======================================================================== 
-    # DEEPGRAM TRANSCRIPTION
-    # ========================================================================
-    async def start_deepgram_transcription():
-        """Start Deepgram for customer"""
-        if state["forward_task"] or not state["customer_track"]:
-            return
-        
-        logger.info("[DEEPGRAM] Starting for customer")
-        
-        try:
-            deepgram_stt = deepgram.STT(
-                model="nova-2-general",
-                language="en-US",
-            )
-            
-            audio_stream = rtc.AudioStream(state["customer_track"])
-            stt_stream = deepgram_stt.stream()
-            
-            async def forward_audio():
-                frame_count = 0
-                async for audio_frame in audio_stream:
-                    if state["call_ended"]:
-                        break
-                    stt_stream.push_frame(audio_frame)
-                    frame_count += 1
-                    if frame_count == 1:
-                        logger.info("[DEEPGRAM] First frame sent")
-                logger.info(f"[DEEPGRAM] Total frames: {frame_count}")
-            
-            async def process_transcripts():
-                async for event in stt_stream:
-                    if state["call_ended"]:
-                        break
-                    if event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
-                        text = event.alternatives[0].text.strip()
-                        if text:
-                            logger.info(f"[DEEPGRAM] {text}")
-                            await send_to_ccm(call_id, customer_id, text, "CONNECTOR")
-            
-            state["forward_task"] = asyncio.create_task(forward_audio())
-            state["process_task"] = asyncio.create_task(process_transcripts())
-            
-            logger.info("[DEEPGRAM] ✅ Started")
-            
-        except Exception as e:
-            logger.error(f"[DEEPGRAM] Error: {e}", exc_info=True)
-    
+
     # ======================================================================== 
     # END CALL FUNCTION
-    # ========================================================================
+    # ======================================================================== 
     async def end_call(reason: str):
-        """End the entire call"""
         if state["call_ended"]:
             return
-        
         state["call_ended"] = True
         state["ai_active"] = False
-        
-        logger.info(f"[CALL] 🔴 Ending - {reason}")
-        
+        logger.info(f"[CALL] 🔴 Ending call - {reason}")
         try:
-            # Cancel tasks
-            for task in [state["forward_task"], state["process_task"]]:
-                if task and not task.done():
-                    task.cancel()
-            
             # Shutdown AI
             if session_ref["session"]:
                 session_ref["session"].shutdown()
-            
             # Remove participants
             livekit_api = api.LiveKitAPI(
                 url=os.getenv("LIVEKIT_URL"),
                 api_key=os.getenv("LIVEKIT_API_KEY"),
                 api_secret=os.getenv("LIVEKIT_API_SECRET")
             )
-            
             for identity in [state["customer_identity"], state["human_agent_identity"]]:
                 if identity:
                     try:
@@ -266,67 +194,40 @@ async def my_agent(ctx: JobContext):
                         logger.info(f"[CALL] Removed: {identity}")
                     except:
                         pass
-            
             logger.info("[CALL] ✅ Ended")
-            
         except Exception as e:
             logger.error(f"[CALL] Error: {e}")
-    
+
     # ======================================================================== 
     # ROOM EVENTS
-    # ========================================================================
+    # ======================================================================== 
     @ctx.room.on("participant_connected")
     def on_participant_connected(participant: rtc.RemoteParticipant):
         logger.info(f"[ROOM] 👤 Joined: {participant.identity}")
-        
-        # Track customer
         if participant.identity.startswith("sip_") and not participant.identity.startswith("human"):
             state["customer_identity"] = participant.identity
-        
-        # Human agent joined
         if participant.identity.startswith("human-agent"):
             state["human_agent_identity"] = participant.identity
-            logger.info("[ROOM] 🟢 Human agent - AI will leave")
-            
+            logger.info("[ROOM] 🟢 Human agent joined - AI will leave")
             async def ai_leave():
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
                 state["ai_active"] = False
                 if session_ref["session"]:
                     session_ref["session"].shutdown()
-                logger.info("[AGENT] ✅ AI left - Deepgram continues")
-            
+                    logger.info("[AGENT] ✅ AI session shutdown, room-level STT continues")
             asyncio.create_task(ai_leave())
-    
-    @ctx.room.on("track_subscribed")
-    def on_track_subscribed(track: rtc.Track, publication: rtc.TrackPublication, participant: rtc.RemoteParticipant):
-        nonlocal customer_id
-        logger.info(f"[ROOM] 🎧 Track: {participant.identity} - {track.kind}")
-        
-        # Update customer ID
-        if customer_id == "unknown" and participant.identity.startswith("sip_"):
-            customer_id = participant.identity.replace("sip_", "")
-        
-        # Store customer audio track for Deepgram
-        if (participant.identity.startswith("sip_") and 
-            not participant.identity.startswith("human") and 
-            track.kind == rtc.TrackKind.KIND_AUDIO):
-            state["customer_track"] = track
-            logger.info("[ROOM] ✅ Customer track stored")
-            asyncio.create_task(start_deepgram_transcription())
-    
+
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant):
         logger.info(f"[ROOM] 👋 Left: {participant.identity}")
-        
-        # End call when customer or agent leaves
         if participant.identity == state["customer_identity"]:
             asyncio.create_task(end_call("Customer disconnected"))
         elif participant.identity == state["human_agent_identity"]:
-            asyncio.create_task(end_call("Agent disconnected"))
-    
+            asyncio.create_task(end_call("Human agent disconnected"))
+
     # ======================================================================== 
     # OPENAI REALTIME SESSION
-    # ========================================================================
+    # ======================================================================== 
     session = AgentSession(
         llm=openai.realtime.RealtimeModel(
             model="gpt-4o-realtime-preview-2024-12-17",
@@ -343,52 +244,54 @@ async def my_agent(ctx: JobContext):
         vad=ctx.proc.userdata["vad"],
     )
     session_ref["session"] = session
-    
-    # AI session events (while AI is active)
+
+    # ------------------------
+    # INITIAL GREETING
+    # ------------------------
+    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    asyncio.create_task(
+        send_to_ccm(call_id, customer_id, "Welcome to Expertflow Support! How can I help you today?", "BOT")
+    )
+    if state["ai_active"]:
+        await session_ref["session"].generate_reply(
+            "Welcome to Expertflow Support! How can I help you today?"
+        )
+
+    # ------------------------
+    # ROOM-LEVEL STT HANDLER
+    # ------------------------
     @session.on("user_input_transcribed")
     def on_user_input_transcribed(event):
-        if not event.is_final or not state["ai_active"]:
+        """Room-level transcription from OpenAI Realtime STT"""
+        if not event.is_final:
             return
-        
         transcript = event.transcript.strip()
         if not transcript:
             return
-        
-        logger.info(f"[CUSTOMER-AI] {transcript}")
+        # Push to CCM
         asyncio.create_task(send_to_ccm(call_id, customer_id, transcript, "CONNECTOR"))
-        
-        # Check transfer
-        keywords = ["transfer", "human", "agent", "representative", "person", "someone", "connect"]
-        if any(k in transcript.lower() for k in keywords):
+        # Detect transfer keywords
+        if any(k in transcript.lower() for k in ["transfer","human","agent","representative","person","someone","connect"]):
             logger.info("[TRANSFER] Keyword detected")
             asyncio.create_task(execute_transfer())
-    
+
     @session.on("conversation_item_added")
     def on_conversation_item_added(event):
+        """AI speaking - push to CCM if AI active"""
         if not state["ai_active"]:
             return
-        
         item = event.item
         if item.role == "assistant" and hasattr(item, 'text_content') and item.text_content:
             text = item.text_content.strip()
             if text:
-                logger.info(f"[AI-BOT] {text}")
                 asyncio.create_task(send_to_ccm(call_id, customer_id, text, "BOT"))
-    
-    # ======================================================================== 
-    # START SESSION
-    # ========================================================================
-    await session.start(
-        agent=Assistant(call_id, customer_id),
-        room=ctx.room,
-    )
-    
-    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
-    
-    logger.info(f"[AGENT] ✅ Connected")
+
+    # Start session
+    await session.start(agent=Assistant(call_id, customer_id), room=ctx.room)
+    logger.info(f"[AGENT] ✅ Connected to room: {call_id}")
 
 # ============================================================================ 
 # RUN SERVER
-# ============================================================================
+# ============================================================================ 
 if __name__ == "__main__":
     cli.run_app(server)

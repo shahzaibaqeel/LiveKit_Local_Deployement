@@ -1,6 +1,6 @@
 """
 ============================================================================
-LIVEKIT AGENT - FINAL WORKING VERSION
+LIVEKIT AGENT - FINAL WORKING VERSION WITH IMMEDIATE GREETING
 ============================================================================
 """
 
@@ -22,6 +22,7 @@ from livekit.agents import (
     cli,
     stt,
     AutoSubscribe,
+    get_job_context,
 )
 from livekit.plugins import silero, openai, deepgram
 
@@ -82,20 +83,34 @@ async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type:
                     if resp.status in [200, 202]:
                         logger.info(f"[CCM] ✅ {sender_type}: {message[:50]}...")
                         return True
-                    else:
-                        text = await resp.text()
-                        logger.error(f"[CCM] Status {resp.status}: {text}")
             except Exception as e:
                 logger.warning(f"[CCM] Attempt {attempt+1}: {e}")
             
             if attempt < 2:
                 await asyncio.sleep(0.5)
     
-    logger.error(f"[CCM] ❌ Failed: {sender_type}")
     return False
 
 # ============================================================================ 
-# ASSISTANT
+# HANGUP CALL FUNCTION
+# ============================================================================
+async def hangup_call():
+    """Properly hangup call by deleting the room"""
+    ctx = get_job_context()
+    if ctx is None:
+        logger.warning("[HANGUP] No job context available")
+        return
+    
+    try:
+        await ctx.api.room.delete_room(
+            api.DeleteRoomRequest(room=ctx.room.name)
+        )
+        logger.info(f"[HANGUP] ✅ Room deleted: {ctx.room.name}")
+    except Exception as e:
+        logger.error(f"[HANGUP] Error: {e}")
+
+# ============================================================================ 
+# ASSISTANT WITH GREETING
 # ============================================================================
 class Assistant(Agent):
     def __init__(self, call_id: str, customer_id: str):
@@ -107,6 +122,26 @@ When a customer asks to speak with a human agent or mentions "transfer", "agent"
         )
         self.call_id = call_id
         self.customer_id = customer_id
+        self.greeting_sent = False
+    
+    async def on_enter(self):
+        """Send greeting immediately when agent enters"""
+        if self.greeting_sent:
+            return
+        
+        self.greeting_sent = True
+        welcome = "Welcome to Expertflow Support, let me know how I can help you?"
+        
+        logger.info("[GREETING] Sending immediately...")
+        await send_to_ccm(self.call_id, self.customer_id, welcome, "BOT")
+        
+        # Trigger AI to speak using generate_reply
+        if self.session:
+            self.session.generate_reply(
+                instructions=f'Say EXACTLY this greeting and nothing else: "{welcome}"'
+            )
+        
+        logger.info("[GREETING] ✅ Sent")
 
 # ============================================================================ 
 # SERVER SETUP
@@ -208,8 +243,8 @@ async def my_agent(ctx: JobContext):
                     stt_stream.push_frame(audio_frame)
                     frame_count += 1
                     if frame_count == 1:
-                        logger.info("[DEEPGRAM] First frame sent")
-                logger.info(f"[DEEPGRAM] Total frames: {frame_count}")
+                        logger.info("[DEEPGRAM] ✅ First frame sent")
+                logger.info(f"[DEEPGRAM] Forwarded {frame_count} frames total")
             
             async def process_transcripts():
                 async for event in stt_stream:
@@ -224,7 +259,7 @@ async def my_agent(ctx: JobContext):
             state["forward_task"] = asyncio.create_task(forward_audio())
             state["process_task"] = asyncio.create_task(process_transcripts())
             
-            logger.info("[DEEPGRAM] ✅ Started")
+            logger.info("[DEEPGRAM] ✅ Tasks started")
             
         except Exception as e:
             logger.error(f"[DEEPGRAM] Error: {e}", exc_info=True)
@@ -243,31 +278,17 @@ async def my_agent(ctx: JobContext):
         logger.info(f"[CALL] 🔴 Ending - {reason}")
         
         try:
-            # Cancel tasks
+            # Cancel Deepgram tasks
             for task in [state["forward_task"], state["process_task"]]:
                 if task and not task.done():
                     task.cancel()
             
-            # Shutdown AI
+            # Shutdown AI session
             if session_ref["session"]:
                 session_ref["session"].shutdown()
             
-            # Remove participants
-            livekit_api = api.LiveKitAPI(
-                url=os.getenv("LIVEKIT_URL"),
-                api_key=os.getenv("LIVEKIT_API_KEY"),
-                api_secret=os.getenv("LIVEKIT_API_SECRET")
-            )
-            
-            for identity in [state["customer_identity"], state["human_agent_identity"]]:
-                if identity:
-                    try:
-                        await livekit_api.room.remove_participant(room=call_id, identity=identity)
-                        logger.info(f"[CALL] Removed: {identity}")
-                    except:
-                        pass
-            
-            logger.info("[CALL] ✅ Ended")
+            # Hangup using LiveKit's proper method
+            await hangup_call()
             
         except Exception as e:
             logger.error(f"[CALL] Error: {e}")
@@ -286,7 +307,7 @@ async def my_agent(ctx: JobContext):
         # Human agent joined
         if participant.identity.startswith("human-agent"):
             state["human_agent_identity"] = participant.identity
-            logger.info("[ROOM] 🟢 Human agent - AI will leave")
+            logger.info("[ROOM] 🟢 Human agent connected - AI will leave")
             
             async def ai_leave():
                 await asyncio.sleep(1)
@@ -344,7 +365,7 @@ async def my_agent(ctx: JobContext):
     )
     session_ref["session"] = session
     
-    # AI session events (while AI is active)
+    # AI session events
     @session.on("user_input_transcribed")
     def on_user_input_transcribed(event):
         if not event.is_final or not state["ai_active"]:
@@ -385,7 +406,7 @@ async def my_agent(ctx: JobContext):
     
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
     
-    logger.info(f"[AGENT] ✅ Connected")
+    logger.info(f"[AGENT] ✅ Connected - Greeting will be sent immediately")
 
 # ============================================================================ 
 # RUN SERVER

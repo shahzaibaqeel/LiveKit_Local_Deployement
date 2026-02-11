@@ -21,6 +21,7 @@ from livekit.agents import (
     JobContext,
     JobProcess,
     cli,
+    llm,
     stt,
 )
 from livekit.plugins import silero, openai, deepgram
@@ -214,6 +215,40 @@ async def my_agent(ctx: JobContext):
             logger.error(f"[TRANSCRIPTION] Error: {e}")
     
     async def transcribe_track(track: rtc.Track, participant_identity: str, is_customer: bool):
+     """Transcribe a specific audio track"""
+    logger.info(f"[TRANSCRIPTION] Starting for {participant_identity}")
+    
+    try:
+        # Create Deepgram STT
+        stt_instance = deepgram.STT(
+            model="nova-2-general",
+            language="en-US",
+        )
+        
+        # Create audio stream
+        audio_stream = rtc.AudioStream(track)
+        stt_stream = stt_instance.stream()
+        
+        # Forward audio
+        async def forward_audio():
+            async for frame in audio_stream:
+                stt_stream.push_frame(frame)
+        
+        forward_task = asyncio.create_task(forward_audio())
+        
+        # Process transcriptions
+        async for event in stt_stream:
+            if event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
+                text = event.alternatives[0].text.strip()
+                if text:
+                    sender_type = "CONNECTOR" if is_customer else "AGENT"
+                    logger.info(f"[TRANSCRIPT] {sender_type}: {text}")
+                    ccm_client.send(call_id, customer_id, text, sender_type)
+        
+        forward_task.cancel()
+        
+    except Exception as e:
+        logger.error(f"[TRANSCRIPTION] Error: {e}", exc_info=True)
         """Transcribe a specific audio track"""
         logger.info(f"[TRANSCRIPTION] Starting for {participant_identity}")
         

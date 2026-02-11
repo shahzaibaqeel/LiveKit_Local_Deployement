@@ -226,12 +226,12 @@ async def my_agent(ctx: JobContext):
     # CUSTOMER SPEECH TO CCM
     # ------------------------------------------------------------------------ #
     @session.on("user_input_transcribed")
-    async def on_user_input_transcribed(event):
+    def on_user_input_transcribed(event):
         if not event.is_final or not ai_active["value"]:
             return
         transcript = event.transcript
         logger.info(f"[USER] {transcript}")
-        await send_to_ccm(call_id, customer_id, transcript, "CONNECTOR")
+        send_to_ccm(call_id, customer_id, transcript, "CONNECTOR")
         keywords = ["transfer", "human", "agent", "representative", "person", "someone", "connect"]
         if any(k in transcript.lower() for k in keywords):
             asyncio.create_task(execute_transfer())
@@ -240,23 +240,23 @@ async def my_agent(ctx: JobContext):
     # AI SPEECH TO CCM
     # ------------------------------------------------------------------------ #
     @session.on("conversation_item_added")
-    async def on_conversation_item_added(event):
+    def on_conversation_item_added(event):
         if not ai_active["value"]:
             return
         item = event.item
         if item.role == "assistant" and hasattr(item, 'text_content') and item.text_content:
             logger.info(f"[AGENT] {item.text_content}")
-            await send_to_ccm(call_id, customer_id, item.text_content, "BOT")
+            send_to_ccm(call_id, customer_id, item.text_content, "BOT")
     
     # ------------------------------------------------------------------------ #
     # ROOM-WIDE TRANSCRIPTION (human + customer)
     # ------------------------------------------------------------------------ #
     @ctx.room.on("transcription_received")
-    async def on_room_transcription(event):
+    def on_room_transcription(event):
         text = event.text.strip()
         if text:
             logger.info(f"[TRANSCRIPT] {text}")
-            await send_to_ccm(call_id, customer_id, text, "CONNECTOR")
+            send_to_ccm(call_id, customer_id, text, "CONNECTOR")
     
     # ------------------------------------------------------------------------ #
     # START SESSION

@@ -22,7 +22,7 @@ from livekit.agents import (
     JobProcess,
     cli,
     stt,
-    llm,
+    tts,
 )
 from livekit.plugins import silero, openai, deepgram
 
@@ -147,8 +147,6 @@ class Assistant(Agent):
         super().__init__(
             instructions="""You are a helpful voice AI assistant for Expertflow Support.
 
-IMPORTANT: Your very first response when the call starts must be exactly: "Welcome to Expertflow Support, let me know how I can help you?"
-
 When a customer asks to speak with a human agent or mentions "transfer", "agent", 
 "representative", "human", "connect me", say "Let me connect you with our team" then STOP speaking.""",
         )
@@ -186,6 +184,7 @@ async def my_agent(ctx: JobContext):
     session_ref = {"session": None}
     ai_active = {"value": True}
     transcription_started = {"value": False}
+    greeting_sent = {"value": False}
     
     # ========================================================================
     # TRANSCRIBE TRACK FUNCTION
@@ -254,6 +253,30 @@ async def my_agent(ctx: JobContext):
             logger.error(f"[TRANSCRIPTION] Error: {e}")
     
     # ========================================================================
+    # SEND WELCOME GREETING
+    # ========================================================================
+    async def send_welcome_greeting():
+        """Send welcome greeting immediately"""
+        if greeting_sent["value"]:
+            return
+        
+        greeting_sent["value"] = True
+        await asyncio.sleep(0.5)  # Small delay for track stability
+        
+        welcome_msg = "Welcome to Expertflow Support, let me know how I can help you?"
+        logger.info(f"[GREETING] Sending welcome message")
+        
+        # Send to CCM
+        ccm_client.send(call_id, customer_id, welcome_msg, "BOT")
+        
+        # Speak using TTS
+        tts_instance = openai.TTS(voice="alloy")
+        async with tts_instance.synthesize(welcome_msg) as stream:
+            async for audio_frame in stream:
+                # Audio will play automatically through session
+                pass
+    
+    # ========================================================================
     # TRANSFER FUNCTION
     # ========================================================================
     async def execute_transfer():
@@ -313,14 +336,17 @@ async def my_agent(ctx: JobContext):
                 if session_ref["session"]:
                     await session_ref["session"].aclose()
                 
-                await ctx.disconnect()
-                logger.info("[AGENT] ✅ AI left - Transcription continues")
+                logger.info("[AGENT] ✅ AI session closed - Transcription continues")
             
             asyncio.create_task(ai_leave())
     
     @ctx.room.on("track_subscribed")
     def on_track_subscribed(track: rtc.Track, publication: rtc.TrackPublication, participant: rtc.RemoteParticipant):
         logger.info(f"[ROOM] 🎧 Track: {participant.identity} - {track.kind}")
+        
+        # Send welcome greeting when first track is ready
+        if track.kind == rtc.TrackKind.KIND_AUDIO and not greeting_sent["value"]:
+            asyncio.create_task(send_welcome_greeting())
         
         # Start transcription when track is ready
         if track.kind == rtc.TrackKind.KIND_AUDIO:
@@ -391,14 +417,6 @@ async def my_agent(ctx: JobContext):
     await ctx.connect()
     
     logger.info(f"[AGENT] ✅ Connected")
-    
-    # Send welcome greeting
-    welcome_msg = "Welcome to Expertflow Support, let me know how I can help you?"
-    session.conversation.item.create(
-        llm.ChatMessage(role="assistant", content=welcome_msg)
-    )
-    session.response.create()
-    ccm_client.send(call_id, customer_id, welcome_msg, "BOT")
     
     # Start room transcription immediately
     await start_room_transcription()

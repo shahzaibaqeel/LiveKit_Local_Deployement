@@ -23,6 +23,7 @@ from livekit.agents import (
     cli,
     stt,
     AutoSubscribe,
+    llm,
 )
 from livekit.plugins import silero, openai, deepgram
 
@@ -83,6 +84,9 @@ async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type:
                     if resp.status in [200, 202]:
                         logger.info(f"[CCM] ✅ {sender_type}: {message[:50]}...")
                         return True
+                    else:
+                        text = await resp.text()
+                        logger.error(f"[CCM] Status {resp.status}: {text}")
             except Exception as e:
                 logger.warning(f"[CCM] Attempt {attempt+1}: {e}")
             
@@ -99,6 +103,8 @@ class Assistant(Agent):
     def __init__(self, call_id: str, customer_id: str):
         super().__init__(
             instructions="""You are a helpful voice AI assistant for Expertflow Support.
+
+Your FIRST message must be: "Welcome to Expertflow Support, let me know how I can help you?"
 
 When a customer asks to speak with a human agent or mentions "transfer", "agent", 
 "representative", "human", "connect me", say "Let me connect you with our team" then STOP speaking."""
@@ -142,6 +148,7 @@ async def my_agent(ctx: JobContext):
     }
     
     session_ref = {"session": None}
+    agent_ref = {"agent": None}
     
     # ======================================================================== 
     # TRANSFER FUNCTION
@@ -181,10 +188,10 @@ async def my_agent(ctx: JobContext):
             state["transfer_triggered"] = False
     
     # ======================================================================== 
-    # DEEPGRAM TRANSCRIPTION - FIX: Proper async handling
+    # DEEPGRAM TRANSCRIPTION
     # ========================================================================
     async def start_deepgram_transcription():
-        """Start Deepgram for customer BEFORE AI leaves"""
+        """Start Deepgram for customer"""
         if state["forward_task"] or not state["customer_track"]:
             return
         
@@ -200,19 +207,15 @@ async def my_agent(ctx: JobContext):
             stt_stream = deepgram_stt.stream()
             
             async def forward_audio():
-                """Forward audio to Deepgram"""
                 frame_count = 0
                 async for audio_frame in audio_stream:
                     if state["call_ended"]:
                         break
                     stt_stream.push_frame(audio_frame)
                     frame_count += 1
-                    if frame_count % 100 == 0:
-                        logger.debug(f"[DEEPGRAM] Frames: {frame_count}")
-                logger.info(f"[DEEPGRAM] Audio forward stopped. Total frames: {frame_count}")
+                logger.info(f"[DEEPGRAM] Forwarded {frame_count} frames")
             
             async def process_transcripts():
-                """Process Deepgram transcripts"""
                 async for event in stt_stream:
                     if state["call_ended"]:
                         break
@@ -221,9 +224,8 @@ async def my_agent(ctx: JobContext):
                         if text:
                             logger.info(f"[DEEPGRAM] {text}")
                             await send_to_ccm(call_id, customer_id, text, "CONNECTOR")
-                logger.info("[DEEPGRAM] Transcript processing stopped")
+                logger.info("[DEEPGRAM] Processing stopped")
             
-            # Store tasks separately
             state["forward_task"] = asyncio.create_task(forward_audio())
             state["process_task"] = asyncio.create_task(process_transcripts())
             
@@ -233,7 +235,7 @@ async def my_agent(ctx: JobContext):
             logger.error(f"[DEEPGRAM] Error: {e}", exc_info=True)
     
     # ======================================================================== 
-    # END CALL FUNCTION - FIX: Proper cleanup
+    # END CALL FUNCTION
     # ========================================================================
     async def end_call(reason: str):
         """End the entire call"""
@@ -246,17 +248,20 @@ async def my_agent(ctx: JobContext):
         logger.info(f"[CALL] 🔴 Ending - {reason}")
         
         try:
-            # Cancel Deepgram tasks
-            if state["forward_task"]:
-                state["forward_task"].cancel()
-            if state["process_task"]:
-                state["process_task"].cancel()
+            # Cancel tasks
+            for task in [state["forward_task"], state["process_task"]]:
+                if task and not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
             
-            # Shutdown AI session
+            # Shutdown AI
             if session_ref["session"]:
                 session_ref["session"].shutdown()
             
-            # Remove all participants
+            # Remove participants
             livekit_api = api.LiveKitAPI(
                 url=os.getenv("LIVEKIT_URL"),
                 api_key=os.getenv("LIVEKIT_API_KEY"),
@@ -268,10 +273,10 @@ async def my_agent(ctx: JobContext):
                     try:
                         await livekit_api.room.remove_participant(room=call_id, identity=identity)
                         logger.info(f"[CALL] Removed: {identity}")
-                    except:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"[CALL] Could not remove {identity}: {e}")
             
-            logger.info("[CALL] ✅ Call ended")
+            logger.info("[CALL] ✅ Ended")
             
         except Exception as e:
             logger.error(f"[CALL] Error: {e}")
@@ -316,27 +321,21 @@ async def my_agent(ctx: JobContext):
             track.kind == rtc.TrackKind.KIND_AUDIO):
             state["customer_track"] = track
             logger.info("[ROOM] ✅ Customer track stored")
-            
-            # Start Deepgram
             asyncio.create_task(start_deepgram_transcription())
         
-        # Send greeting - FIX: Use OpenAI Realtime, not session.say()
+        # Send greeting using agent
         if track.kind == rtc.TrackKind.KIND_AUDIO and not state["greeting_sent"]:
             state["greeting_sent"] = True
             
             async def send_greeting():
-                await asyncio.sleep(1)
+                await asyncio.sleep(1.5)
                 welcome = "Welcome to Expertflow Support, let me know how I can help you?"
                 logger.info("[GREETING] Sending...")
                 await send_to_ccm(call_id, customer_id, welcome, "BOT")
                 
-                # Trigger OpenAI to speak the greeting
-                if session_ref["session"] and state["ai_active"]:
-                    session_ref["session"].conversation.item.create(
-                        role="assistant",
-                        content=[{"type": "input_text", "text": welcome}]
-                    )
-                    session_ref["session"].response.create()
+                # Use agent to speak
+                if agent_ref["agent"] and state["ai_active"]:
+                    await agent_ref["agent"].say(welcome)
             
             asyncio.create_task(send_greeting())
     
@@ -344,9 +343,11 @@ async def my_agent(ctx: JobContext):
     def on_participant_disconnected(participant: rtc.RemoteParticipant):
         logger.info(f"[ROOM] 👋 Left: {participant.identity}")
         
-        # End call when anyone leaves
-        if participant.identity in [state["customer_identity"], state["human_agent_identity"]]:
-            asyncio.create_task(end_call(f"{participant.identity} left"))
+        # End call when customer or agent leaves
+        if participant.identity == state["customer_identity"]:
+            asyncio.create_task(end_call("Customer disconnected"))
+        elif participant.identity == state["human_agent_identity"]:
+            asyncio.create_task(end_call("Agent disconnected"))
     
     # ======================================================================== 
     # OPENAI REALTIME SESSION
@@ -402,11 +403,10 @@ async def my_agent(ctx: JobContext):
     # ======================================================================== 
     # START SESSION
     # ========================================================================
-    await session.start(
-        agent=Assistant(call_id, customer_id),
-        room=ctx.room,
-    )
+    agent = Assistant(call_id, customer_id)
+    agent_ref["agent"] = agent
     
+    await session.start(agent=agent, room=ctx.room)
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
     
     logger.info(f"[AGENT] ✅ Connected")

@@ -21,7 +21,7 @@ from livekit.agents import (
     JobContext,
     JobProcess,
     cli,
-    transcription,
+    stt,
 )
 from livekit.plugins import silero, openai, deepgram
 
@@ -236,7 +236,7 @@ async def my_agent(ctx: JobContext):
             
             # Process transcriptions
             async for event in stream:
-                if event.type == transcription.SpeechEventType.FINAL_TRANSCRIPT:
+                if event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
                     text = event.alternatives[0].text.strip()
                     if text:
                         sender_type = "CONNECTOR" if is_customer else "AGENT"

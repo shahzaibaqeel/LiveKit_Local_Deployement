@@ -235,7 +235,7 @@ async def my_agent(ctx: JobContext):
             
             outbound_trunk_id = "ST_W7jqvDFA2VgG"
             agent_extension = "99900"
-            fusionpbx_ip = "192.168.2.24"
+            fusionpbx_ip = "192.168.1.17"
             
             logger.info(f"📞 Calling: sip:{agent_extension}@{fusionpbx_ip}:5060")
             logger.info(f"📞 Using trunk: {outbound_trunk_id}")

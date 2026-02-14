@@ -44,7 +44,7 @@ async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type:
     # 1. Base Channel Data (Common to all)
     channel_data = {
         "channelCustomerIdentifier": customer_id,  # Extracted from SIP participant
-        "serviceIdentifier": "5888",           # Keep as is (per user instruction)
+        "serviceIdentifier": "9874",           # Keep as is (per user instruction)
         "channelTypeCode": "CX_VOICE"
     }
 

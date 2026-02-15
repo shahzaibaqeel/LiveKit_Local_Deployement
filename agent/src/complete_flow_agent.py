@@ -225,6 +225,11 @@ async def my_agent(ctx: JobContext):
         logger.info(f"🔴 EXECUTING TRANSFER NOW")
         
         await send_to_ccm(call_id, customer_id, "Connecting you to our live agent...", "BOT")
+
+        # Update instructions to silence the bot BUT keep it listening for transcription
+        session.session_update(
+            instructions="You are now a silent scribe. Do not speak. Only listen and transcribe user speech."
+        )
         
         try:
             livekit_api = api.LiveKitAPI(
@@ -472,6 +477,21 @@ async def my_agent(ctx: JobContext):
     await ctx.connect()
     
     logger.info(f"✅ AGENT CONNECTED TO ROOM: {call_id}")
+
+    # ========================================================================
+    # FORCE WELCOME MESSAGE
+    # ========================================================================
+    # Wait a moment for connection to stabilize
+    await asyncio.sleep(1)
+    
+    welcome_text = "Welcome to ExpertFlow. How can I assist you today?"
+    logger.info(f"📢 TRIGGERING WELCOME MESSAGE: '{welcome_text}'")
+    
+    await session.response.create(
+        response={
+            "instructions": f"Say exactly: '{welcome_text}'",
+        }
+    )
 
 # ============================================================================
 # RUN SERVER

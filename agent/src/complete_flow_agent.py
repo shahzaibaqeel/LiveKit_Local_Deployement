@@ -4,6 +4,7 @@ LIVEKIT AGENT WITH OPENAI REALTIME API + CALL TRANSFER TO HUMAN AGENT
 Uses user_input_transcribed event - THE CORRECT WAY
 ============================================================================
 """
+
 import logging
 import os
 import time
@@ -23,12 +24,15 @@ from livekit.agents import (
 )
 from livekit.plugins import silero
 from livekit.plugins import openai
+
 # Load environment variables
 current_dir = Path(__file__).parent
 env_file = current_dir / ".env"
 load_dotenv(dotenv_path=env_file, override=True)
+
 logger = logging.getLogger("agent")
 logger.setLevel(logging.INFO)
+
 # ============================================================================
 # CCM API HELPER
 # ============================================================================
@@ -43,7 +47,9 @@ async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type:
         "serviceIdentifier": "9876",           # Keep as is (per user instruction)
         "channelTypeCode": "CX_VOICE"
     }
+
     payload = {}
+
     # 2. BOT SENDER (Minimal Header)
     if sender_type == "BOT":
         payload = {
@@ -62,6 +68,7 @@ async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type:
                 "markdownText": message
             }
         }
+
     # 3. CONNECTOR / AGENT SENDER (Full Header)
     else:
         sender_obj = {}
@@ -79,6 +86,7 @@ async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type:
                 "senderName": "WEB_CONNECTOR",
                 "additionalDetail": None
             }
+
         payload = {
             "id": call_id,
             "header": {
@@ -99,8 +107,9 @@ async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type:
             }
         }
     
-    logger.info(f"📤 SENDING TO CCM [{sender_type}]: {str(message)[:80]}...")
+    logger.info(f"📤 SENDING TO CCM [{sender_type}]: {message[:80]}...")
     logger.debug(f"📦 CCM Payload: {payload}")
+
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -125,6 +134,8 @@ async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type:
     except Exception as e:
         logger.error(f"❌ CCM UNEXPECTED ERROR [{sender_type}]: {type(e).__name__} - {str(e)}", exc_info=True)
         return False
+
+
 # ============================================================================
 # AGENT DEFINITION
 # ============================================================================
@@ -132,19 +143,24 @@ class Assistant(Agent):
     def __init__(self, call_id: str, customer_id: str) -> None:
         super().__init__(
             instructions="""You are a helpful voice AI assistant.
+
 When a customer asks to speak with a human agent or mentions "transfer", "agent", 
 "representative", "human", "connect me", say "Let me connect you with our team" then STOP speaking.""",
         )
         self.call_id = call_id
         self.customer_id = customer_id
+
 # ============================================================================
 # SERVER SETUP
 # ============================================================================
 server = AgentServer()
+
 def prewarm(proc: JobProcess):
     """Preload VAD model"""
     proc.userdata["vad"] = silero.VAD.load()
+
 server.setup_fnc = prewarm
+
 # ============================================================================
 # MAIN AGENT HANDLER
 # ============================================================================
@@ -197,52 +213,6 @@ async def my_agent(ctx: JobContext):
         return identity
     
     # ========================================================================
-    # TRANSCRIPTION HELPER
-    # ========================================================================
-    async def transcribe_participant(participant: rtc.RemoteParticipant, sender_type: str):
-        """
-        Transcribe a specific participant using OpenAI STT and send to CCM.
-        Used during transfer when the main AgentSession is disabled.
-        """
-        logger.info(f"🎤 STARTING INDEPENDENT TRANSCRIPTION FOR: {participant.identity} ({sender_type})")
-        
-        # Ensure we have an audio track
-        audio_track = None
-        for pub in participant.track_publications.values():
-            if pub.track and pub.track.kind == rtc.TrackKind.KIND_AUDIO:
-                audio_track = pub.track
-                break
-        if not audio_track:
-             logger.warning(f"⚠️ No audio track found for {participant.identity}, cannot start STT yet.")
-             return
-        try:
-            stt_provider = openai.STT(language="en")
-            stream = stt_provider.stream()
-            async def audio_stream_task(track):
-                logger.info(f"🎧 STARTED AUDIO STREAM TASK FOR {participant.identity}")
-                audio_stream = rtc.AudioStream(track)
-                try:
-                    async for frame in audio_stream:
-                        stream.push_frame(frame)
-                except Exception as e:
-                     logger.error(f"❌ Audio stream error for {participant.identity}: {e}")
-                finally:
-                    stream.end_input()
-                    logger.info(f"🛑 ENDED AUDIO STREAM TASK FOR {participant.identity}")
-            # Start streaming audio
-            asyncio.create_task(audio_stream_task(audio_track))
-            # Process events
-            async for event in stream:
-                if event.type == openai.stt.SpeechEventType.FINAL_TRANSCRIPT:
-                    transcript_text = event.alternatives[0].text
-                    if transcript_text.strip():
-                        logger.info(f"📝 STT TRANSCRIPT [{sender_type}]: {transcript_text}")
-                        if len(transcript_text) > 1:
-                            asyncio.create_task(send_to_ccm(call_id, customer_id, transcript_text, sender_type))
-                            
-        except Exception as e:
-            logger.error(f"❌ TRANSCRIPTION ERROR for {participant.identity}: {e}", exc_info=True)
-    # ========================================================================
     # TRANSFER FUNCTION
     # ========================================================================
     async def execute_transfer():
@@ -255,12 +225,6 @@ async def my_agent(ctx: JobContext):
         logger.info(f"🔴 EXECUTING TRANSFER NOW")
         
         await send_to_ccm(call_id, customer_id, "Connecting you to our live agent...", "BOT")
-        # Find customer participant to transcribe
-        for p in ctx.room.remote_participants.values():
-             if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP and p.identity.startswith("sip_"):
-                 # Start transcribing customer immediately as we are "muting" the bot
-                 asyncio.create_task(transcribe_participant(p, "CONNECTOR"))
-                 break
         
         try:
             livekit_api = api.LiveKitAPI(
@@ -316,6 +280,7 @@ async def my_agent(ctx: JobContext):
                 logger.info(f"📞 CUSTOMER IDENTIFIED: {customer_id} (from {participant.identity})")
             else:
                 logger.info(f"🟢 HUMAN AGENT CONNECTED TO ROOM")
+
     
     @ctx.room.on("track_subscribed")
     def on_track_subscribed(track: rtc.Track, publication: rtc.TrackPublication, participant: rtc.RemoteParticipant):
@@ -328,41 +293,10 @@ async def my_agent(ctx: JobContext):
             if participant.identity.startswith("sip_"):
                 customer_id = extract_customer_id_from_participant(participant.identity)
                 logger.info(f"📞 CUSTOMER IDENTIFIED FROM TRACK: {customer_id} (from {participant.identity})")
-        # If transfer is active and this is audio, ensure we are transcribing
-        if transfer_triggered["value"] and track.kind == rtc.TrackKind.KIND_AUDIO:
-             # Identify if this is the customer or agent
-             sender_type = None
-             if participant.identity.startswith("sip_"):
-                 sender_type = "CONNECTOR"
-             elif participant.identity == "human-agent-general" or participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP: # Fallback check
-                 sender_type = "AGENT"
-             
-             if sender_type:
-                 logger.info(f"🎤 Track subscribed for {participant.identity}, starting STT as {sender_type}")
-                 asyncio.create_task(transcribe_participant(participant, sender_type))
     
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant):
         logger.info(f"👋 LEFT: {participant.identity}")
-        # Call End Logic - FORCE END
-        if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
-             logger.info(f"🛑 SIP PARTICIPANT LEFT: {participant.identity} -> ENDING CALL FOR ALL")
-             
-             async def terminate_all():
-                 try:
-                     livekit_api = api.LiveKitAPI(
-                        url=os.getenv("LIVEKIT_URL"),
-                        api_key=os.getenv("LIVEKIT_API_KEY"),
-                        api_secret=os.getenv("LIVEKIT_API_SECRET")
-                     )
-                     logger.info(f"🔥 DELETING ROOM {call_id} TO FORCE HANGUP")
-                     await livekit_api.room.delete_room(api.DeleteRoomRequest(room=call_id))
-                     logger.info(f"✅ ROOM DELETED")
-                 except Exception as e:
-                     logger.error(f"❌ Failed to delete room: {e}")
-                     await ctx.room.disconnect()
-            
-             asyncio.create_task(terminate_all())
     
     # ========================================================================
     # EXTRACT CUSTOMER ID FROM EXISTING PARTICIPANTS (TIMING FIX)
@@ -418,9 +352,6 @@ async def my_agent(ctx: JobContext):
         event.transcript: The transcribed text
         event.is_final: Whether this is the final version
         """
-        # IF TRANSFERRED, IGNORE SESSION EVENTS (BOT IS MUTED)
-        if transfer_triggered["value"]:
-            return
         transcript = event.transcript
         is_final = event.is_final
         
@@ -458,9 +389,6 @@ async def my_agent(ctx: JobContext):
         Captures when agent speech is created (TTS audio being generated)
         This is the PRIMARY way to capture agent responses in real-time
         """
-        # IF TRANSFERRED, IGNORE SESSION EVENTS (BOT IS MUTED)
-        if transfer_triggered["value"]:
-            return
         if hasattr(event, 'text') and event.text:
             agent_text = event.text
             
@@ -500,9 +428,6 @@ async def my_agent(ctx: JobContext):
         Backup handler for agent responses (text-based)
         This captures responses that might not go through agent_speech
         """
-        # IF TRANSFERRED, IGNORE SESSION EVENTS (BOT IS MUTED)
-        if transfer_triggered["value"]:
-            return
         item = event.item
         
         if item.role == "assistant":
@@ -547,6 +472,7 @@ async def my_agent(ctx: JobContext):
     await ctx.connect()
     
     logger.info(f"✅ AGENT CONNECTED TO ROOM: {call_id}")
+
 # ============================================================================
 # RUN SERVER
 # ============================================================================

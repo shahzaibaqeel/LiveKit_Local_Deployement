@@ -143,9 +143,8 @@ class Assistant(Agent):
     def __init__(self, call_id: str, customer_id: str) -> None:
         super().__init__(
             instructions="""You are a helpful voice AI assistant.
-
-When a customer asks to speak with a human agent or mentions "transfer", "agent", 
-"representative", "human", "connect me", say "Let me connect you with our team" then STOP speaking."""
+            When a customer asks to speak with a human agent or mentions "transfer", "agent", 
+            "representative", "human", "connect me", say "Let me connect you with our team" then STOP speaking.""",
         )
         self.call_id = call_id
         self.customer_id = customer_id
@@ -225,20 +224,7 @@ async def my_agent(ctx: JobContext):
         logger.info(f"🔴 EXECUTING TRANSFER NOW")
         
         await send_to_ccm(call_id, customer_id, "Connecting you to our live agent...", "BOT")
-
-        # Update instructions to silence the bot via generic conversation item
-        logger.info("silencing bot via conversation item")
-        try:
-             session.conversation.item.create(
-                openai.realtime.RealtimeItem(
-                    type="message",
-                    role="user",
-                    content=[{"type": "input_text", "text": "You are now a silent scribe. Do not speak. Only listen and transcribe."}]
-                )
-            )
-        except Exception as e:
-            logger.error(f"Failed to set silent mode: {e}")
-
+        
         try:
             livekit_api = api.LiveKitAPI(
                 url=os.getenv("LIVEKIT_URL"),
@@ -485,35 +471,6 @@ async def my_agent(ctx: JobContext):
     await ctx.connect()
     
     logger.info(f"✅ AGENT CONNECTED TO ROOM: {call_id}")
-    
-    # DEBUG: Inspect session object
-    logger.info(f"🧐 Session Type: {type(session)}")
-    logger.info(f"🧐 Session Dir: {dir(session)}")
-    
-    # ========================================================================
-    # FORCE WELCOME MESSAGE
-    # ========================================================================
-    # Wait a moment for connection to stabilize
-    await asyncio.sleep(1)
-    
-    welcome_text = "Welcome to ExpertFlow. How can I assist you today?"
-    logger.info(f"📢 TRIGGERING WELCOME MESSAGE: '{welcome_text}'")
-    
-    # Use conversation item to trigger response since session.response might not be available
-    # We send a "user" message command which the model should reply to
-    try:
-        session.conversation.item.create(
-            openai.realtime.RealtimeItem(
-                type="message", 
-                role="user", 
-                content=[{"type": "input_text", "text": f"Say exactly: '{welcome_text}'"}]
-            )
-        )
-        # Attempt to trigger generation if possible, otherwise rely on VAD/auto-turn
-        if hasattr(session, 'response') and hasattr(session.response, 'create'):
-             await session.response.create()
-    except Exception as e:
-        logger.error(f"❌ Failed to trigger welcome message: {e}")
 
 # ============================================================================
 # RUN SERVER

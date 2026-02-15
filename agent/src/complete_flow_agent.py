@@ -141,12 +141,7 @@ async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type:
 # ============================================================================
 class Assistant(Agent):
     def __init__(self, call_id: str, customer_id: str) -> None:
-        super().__init__(
-            instructions="""You are a helpful voice AI assistant.
-
-When a customer asks to speak with a human agent or mentions "transfer", "agent", 
-"representative", "human", "connect me", say "Let me connect you with our team" then STOP speaking.""",
-        )
+        super().__init__()
         self.call_id = call_id
         self.customer_id = customer_id
 
@@ -337,6 +332,11 @@ async def my_agent(ctx: JobContext):
     session = AgentSession(
         llm=openai.realtime.RealtimeModel(
             model="gpt-4o-realtime-preview-2024-12-17",
+            # Instructions for the AI
+            instructions="""You are a helpful voice AI assistant.
+
+When a customer asks to speak with a human agent or mentions "transfer", "agent", 
+"representative", "human", "connect me", say "Let me connect you with our team" then STOP speaking.""",
             voice="alloy",
             temperature=0.8,
             modalities=['text', 'audio'],
@@ -485,7 +485,11 @@ async def my_agent(ctx: JobContext):
     await ctx.connect()
     
     logger.info(f"✅ AGENT CONNECTED TO ROOM: {call_id}")
-
+    
+    # DEBUG: Inspect session object
+    logger.info(f"🧐 Session Type: {type(session)}")
+    logger.info(f"🧐 Session Dir: {dir(session)}")
+    
     # ========================================================================
     # FORCE WELCOME MESSAGE
     # ========================================================================

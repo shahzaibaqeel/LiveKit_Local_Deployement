@@ -332,11 +332,6 @@ async def my_agent(ctx: JobContext):
     session = AgentSession(
         llm=openai.realtime.RealtimeModel(
             model="gpt-4o-realtime-preview-2024-12-17",
-            # Instructions for the AI
-            instructions="""You are a helpful voice AI assistant.
-
-When a customer asks to speak with a human agent or mentions "transfer", "agent", 
-"representative", "human", "connect me", say "Let me connect you with our team" then STOP speaking.""",
             voice="alloy",
             temperature=0.8,
             modalities=['text', 'audio'],
@@ -489,6 +484,28 @@ When a customer asks to speak with a human agent or mentions "transfer", "agent"
     # DEBUG: Inspect session object
     logger.info(f"🧐 Session Type: {type(session)}")
     logger.info(f"🧐 Session Dir: {dir(session)}")
+    
+    # ========================================================================
+    # SET SYSTEM INSTRUCTIONS
+    # ========================================================================
+    # Add system instructions as the first conversation item
+    try:
+        session.conversation.item.create(
+            openai.realtime.RealtimeItem(
+                type="message",
+                role="system",
+                content=[{
+                    "type": "input_text",
+                    "text": """You are a helpful voice AI assistant.
+
+When a customer asks to speak with a human agent or mentions 'transfer', 'agent', 
+'representative', 'human', 'connect me', say 'Let me connect you with our team' then STOP speaking."""
+                }]
+            )
+        )
+        logger.info("✅ System instructions set")
+    except Exception as e:
+        logger.error(f"❌ Failed to set system instructions: {e}")
     
     # ========================================================================
     # FORCE WELCOME MESSAGE

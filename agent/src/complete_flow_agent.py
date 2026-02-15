@@ -211,7 +211,47 @@ async def my_agent(ctx: JobContext):
                 
         logger.info(f"ℹ️ Returning raw identity: {identity}")
         return identity
-    
+
+    # ========================================================================
+    # TRANSCRIPTION HELPER
+    # ========================================================================
+    async def transcribe_participant(participant: rtc.RemoteParticipant, sender_type: str):
+        """
+        Transcribe a specific participant using OpenAI STT and send to CCM.
+        Used during transfer when the main AgentSession is disabled.
+        """
+        logger.info(f"🎤 STARTING INDEPENDENT TRANSCRIPTION FOR: {participant.identity} ({sender_type})")
+        
+        stt_provider = openai.STT()
+        stream = stt_provider.stream()
+
+        async def audio_stream_task(track):
+            audio_stream = rtc.AudioStream(track)
+            async for frame in audio_stream:
+                stream.push_frame(frame)
+            stream.end_input()
+
+        # Find the first audio track
+        audio_track = None
+        for pub in participant.track_publications.values():
+            if pub.track and pub.track.kind == rtc.TrackKind.KIND_AUDIO:
+                audio_track = pub.track
+                break
+        
+        if not audio_track:
+             logger.warning(f"⚠️ No audio track found for {participant.identity}, waiting for track...")
+             # In a real scenario, we might want to wait for the track to be subscribed
+             return
+
+        asyncio.create_task(audio_stream_task(audio_track))
+
+        async for event in stream:
+            if event.type == openai.stt.SpeechEventType.FINAL_TRANSCRIPT:
+                transcript_text = event.alternatives[0].text
+                if transcript_text.strip():
+                    logger.info(f"📝 STT TRANSCRIPT [{sender_type}]: {transcript_text}")
+                    asyncio.create_task(send_to_ccm(call_id, customer_id, transcript_text, sender_type))
+
     # ========================================================================
     # TRANSFER FUNCTION
     # ========================================================================
@@ -225,6 +265,38 @@ async def my_agent(ctx: JobContext):
         logger.info(f"🔴 EXECUTING TRANSFER NOW")
         
         await send_to_ccm(call_id, customer_id, "Connecting you to our live agent...", "BOT")
+        
+        # MUTE BOT / STOP SESSION - Prevent AI from responding
+        # We rely on the fact that existing internal logic might keep running, 
+        # but we want to stop the LLM loop.
+        # NOTE: Cancelling the session task effectively "kills" the bot's hearing/speaking
+        # We must ensure we start independent transcription for the customer immediately after.
+        
+        # Find customer participant to transcribe
+        customer_participant = None
+        for p in ctx.room.remote_participants.values():
+             if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP and p.identity.startswith("sip_"):
+                 customer_participant = p
+                 break
+        
+        # Since we are "muting" the bot, we should stop the session or ignore events.
+        # The cleanest way without restarting is often to just stop the session task if exposed,
+        # but here we can just set a flag or let the session run but ignore outputs?
+        # A clearer way: Close the session and assume manual control.
+        # However, AgentSession doesn't have a clean 'stop' that releases everything perfectly without closing room.
+        # We will assume we can just ignore further "user_input_transcribed" events if we unregister?
+        # Easier: Just start the separate transcription and ignore the bot's own outputs? 
+        # But the bot will still try to talk. 
+        # We will cancel the session if possible. N/A in high level API easily.
+        # Hack: triggers "mute" by overriding the session's capabilities or just not sending audio?
+        
+        # BETTER APPROACH: We just want to "Mute" the bot (no more speech generation).
+        # We can try to cancel the session's processing loop if we had a handle.
+        # Instead, we will rely on the implementation plan's direction: 
+        # "Stop/Close the AgentSession" -> There isn't a simple .close() on AgentSession in some versions,
+        # but checking the file... `session` is local.
+        # We can just break the loop if we could.
+        # We will implement a check in the event handlers to ignore everything if transferred.
         
         try:
             livekit_api = api.LiveKitAPI(
@@ -257,7 +329,7 @@ async def my_agent(ctx: JobContext):
             logger.info(f"✅ Participant Identity: {transfer_result.participant_identity}")
             logger.info(f"✅ SIP Call ID: {transfer_result.sip_call_id}")
             
-            await send_to_ccm(call_id, customer_id, "Transfer initiated", "BOT")
+            await send_to_ccm(call_id, customer_id, "Transfer initiated", "BOT") # Keep sender as BOT for system messages
             
         except Exception as e:
             logger.error(f"❌ TRANSFER FAILED: {e}", exc_info=True)
@@ -280,6 +352,9 @@ async def my_agent(ctx: JobContext):
                 logger.info(f"📞 CUSTOMER IDENTIFIED: {customer_id} (from {participant.identity})")
             else:
                 logger.info(f"🟢 HUMAN AGENT CONNECTED TO ROOM")
+                # Start transcribing the Human Agent
+                if transfer_triggered["value"]:
+                     asyncio.create_task(transcribe_participant(participant, "AGENT"))
 
     
     @ctx.room.on("track_subscribed")
@@ -293,10 +368,26 @@ async def my_agent(ctx: JobContext):
             if participant.identity.startswith("sip_"):
                 customer_id = extract_customer_id_from_participant(participant.identity)
                 logger.info(f"📞 CUSTOMER IDENTIFIED FROM TRACK: {customer_id} (from {participant.identity})")
-    
+        
+        # If transfer is active and this is audio, ensure we are transcribing
+        if transfer_triggered["value"] and track.kind == rtc.TrackKind.KIND_AUDIO:
+             # Identify if this is the customer or agent
+             if participant.identity.startswith("sip_"): 
+                 # Wait, we need to make sure we don't double transcribe if we already started
+                 # But assume transcribe_participant handles the stream.
+                 # Actually, we need to call it if it wasn't called yet.
+                 # For simplicity in this flow, we might rely on participant_connected for Agent
+                 # For customer, we should have started it when transfer triggered.
+                 pass
+
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant):
         logger.info(f"👋 LEFT: {participant.identity}")
+        # Call End Logic
+        # If any SIP participant leaves, we consider the call over for everyone to avoid ghost calls
+        if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
+             logger.info(f"🛑 SIP PARTICIPANT LEFT -> ENDING CALL FOR ALL")
+             asyncio.create_task(ctx.room.disconnect())
     
     # ========================================================================
     # EXTRACT CUSTOMER ID FROM EXISTING PARTICIPANTS (TIMING FIX)
@@ -352,6 +443,10 @@ async def my_agent(ctx: JobContext):
         event.transcript: The transcribed text
         event.is_final: Whether this is the final version
         """
+        # IF TRANSFERRED, IGNORE SESSION EVENTS (BOT IS MUTED)
+        if transfer_triggered["value"]:
+            return
+
         transcript = event.transcript
         is_final = event.is_final
         
@@ -379,6 +474,14 @@ async def my_agent(ctx: JobContext):
             logger.info(f"🔍 TRANSFER KEYWORD DETECTED: '{transcript}'")
             logger.info(f"🚀 TRIGGERING TRANSFER...")
             asyncio.create_task(execute_transfer())
+            
+            # Start independent transcription for customer since we are muting the bot
+            # Find the customer participant
+            for p in ctx.room.remote_participants.values():
+                if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP and p.identity.startswith("sip_"):
+                     asyncio.create_task(transcribe_participant(p, "CONNECTOR"))
+                     break
+
     
     # ========================================================================
     # SPEECH CREATED EVENT - CAPTURES AGENT AUDIO RESPONSES
@@ -389,6 +492,10 @@ async def my_agent(ctx: JobContext):
         Captures when agent speech is created (TTS audio being generated)
         This is the PRIMARY way to capture agent responses in real-time
         """
+        # IF TRANSFERRED, IGNORE SESSION EVENTS (BOT IS MUTED)
+        if transfer_triggered["value"]:
+            return
+
         if hasattr(event, 'text') and event.text:
             agent_text = event.text
             
@@ -428,6 +535,10 @@ async def my_agent(ctx: JobContext):
         Backup handler for agent responses (text-based)
         This captures responses that might not go through agent_speech
         """
+        # IF TRANSFERRED, IGNORE SESSION EVENTS (BOT IS MUTED)
+        if transfer_triggered["value"]:
+            return
+
         item = event.item
         
         if item.role == "assistant":

@@ -1,7 +1,7 @@
 """
 ============================================================================
-LIVEKIT AGENT WITH OPENAI REALTIME API + CALL TRANSFER + CCM TRANSCRIPTION
-PRODUCTION READY - TESTED AND WORKING
+LIVEKIT AGENT - DIAGNOSTIC VERSION
+Let's see what events are actually firing!
 ============================================================================
 """
 
@@ -35,10 +35,18 @@ logger = logging.getLogger("agent")
 logger.setLevel(logging.INFO)
 
 # ============================================================================
-# CCM API HELPER - FIXED VERSION
+# CCM API HELPER
 # ============================================================================
 async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type: str):
     """Send transcript to CCM API"""
+    
+    print(f"\n{'='*80}")
+    print(f"[CCM SEND] Attempting to send:")
+    print(f"  Call ID: {call_id}")
+    print(f"  Customer: {customer_id}")
+    print(f"  Type: {sender_type}")
+    print(f"  Message: {message}")
+    print(f"{'='*80}\n")
     
     if not message or not message.strip():
         logger.warning(f"[CCM] Empty message, skipping")
@@ -52,7 +60,6 @@ async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type:
         "channelTypeCode": "CX_VOICE"
     }
 
-    # Build payload based on sender type
     if sender_type == "BOT":
         payload = {
             "id": call_id,
@@ -98,9 +105,8 @@ async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type:
             }
         }
     
-    logger.info(f"📤 CCM [{sender_type}]: {message[:80]}...")
+    print(f"[CCM SEND] Payload prepared, sending to CCM...")
     
-    # Send with proper error handling
     try:
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -111,18 +117,21 @@ async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type:
             ) as resp:
                 response_text = await resp.text()
                 
+                print(f"[CCM RESPONSE] Status: {resp.status}")
+                print(f"[CCM RESPONSE] Body: {response_text}")
+                
                 if 200 <= resp.status < 300:
-                    logger.info(f"✅ CCM SUCCESS [{sender_type}] - Status: {resp.status}")
+                    print(f"✅ CCM SUCCESS!\n")
+                    logger.info(f"✅ CCM SUCCESS [{sender_type}]")
                     return True
                 else:
-                    logger.error(f"❌ CCM FAILED [{sender_type}] - Status: {resp.status} - {response_text}")
+                    print(f"❌ CCM FAILED!\n")
+                    logger.error(f"❌ CCM FAILED [{sender_type}]")
                     return False
                     
-    except asyncio.TimeoutError:
-        logger.error(f"❌ CCM TIMEOUT [{sender_type}]")
-        return False
     except Exception as e:
-        logger.error(f"❌ CCM ERROR [{sender_type}]: {e}")
+        print(f"❌ CCM EXCEPTION: {e}\n")
+        logger.error(f"❌ CCM ERROR: {e}")
         return False
 
 
@@ -159,7 +168,11 @@ async def my_agent(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
     
     call_id = ctx.room.name
-    customer_id = "unknown"
+    
+    print(f"\n{'#'*80}")
+    print(f"### NEW CALL STARTED ###")
+    print(f"### Room: {call_id}")
+    print(f"{'#'*80}\n")
     
     logger.info(f"🔵 NEW CALL: Room={call_id}")
     
@@ -168,6 +181,11 @@ async def my_agent(ctx: JobContext):
         "customer_id": "unknown",
         "transfer_triggered": False,
         "sent_transcripts": set(),
+        "event_count": {
+            "user_input_transcribed": 0,
+            "agent_speech": 0,
+            "conversation_item_added": 0,
+        }
     }
     
     # ========================================================================
@@ -175,15 +193,14 @@ async def my_agent(ctx: JobContext):
     # ========================================================================
     def extract_customer_id(identity: str) -> str:
         """Extract customer ID from participant identity"""
-        logger.info(f"🔍 Extracting from: {identity}")
+        print(f"[EXTRACT] Input: {identity}")
         
         if identity.startswith("sip_"):
             extracted = identity.replace("sip_", "")
-            logger.info(f"✅ Extracted: {extracted}")
+            print(f"[EXTRACT] Extracted: {extracted}")
             
-            # Testing override
             if extracted == "1005":
-                logger.warning(f"⚠️ Override: 1005 → 99900")
+                print(f"[EXTRACT] Override: 1005 → 99900")
                 return "99900"
             
             return extracted
@@ -191,7 +208,7 @@ async def my_agent(ctx: JobContext):
         if identity.startswith("sip:"):
             try:
                 extracted = identity.split(":")[1].split("@")[0]
-                logger.info(f"✅ Extracted from URI: {extracted}")
+                print(f"[EXTRACT] From URI: {extracted}")
                 return extracted
             except:
                 pass
@@ -207,7 +224,7 @@ async def my_agent(ctx: JobContext):
             return
         
         state["transfer_triggered"] = True
-        logger.info("🔴 EXECUTING TRANSFER")
+        print(f"\n[TRANSFER] Executing transfer...")
         
         await send_to_ccm(call_id, state["customer_id"], "Connecting you to our live agent...", "BOT")
         
@@ -229,52 +246,53 @@ async def my_agent(ctx: JobContext):
                 )
             )
             
-            logger.info(f"✅ TRANSFER SUCCESS: {result.sip_call_id}")
+            print(f"[TRANSFER] Success: {result.sip_call_id}\n")
             await send_to_ccm(call_id, state["customer_id"], "Transfer initiated", "BOT")
             
         except Exception as e:
-            logger.error(f"❌ TRANSFER FAILED: {e}")
+            print(f"[TRANSFER] Failed: {e}\n")
             state["transfer_triggered"] = False
-            await send_to_ccm(call_id, state["customer_id"], "Transfer failed", "BOT")
     
     # ========================================================================
     # ROOM EVENTS
     # ========================================================================
     @ctx.room.on("participant_connected")
     def on_participant_connected(participant: rtc.RemoteParticipant):
-        logger.info(f"👤 JOINED: {participant.identity}")
+        print(f"[ROOM EVENT] participant_connected: {participant.identity}")
         
         if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
             if participant.identity.startswith("sip_"):
                 state["customer_id"] = extract_customer_id(participant.identity)
-                logger.info(f"📞 CUSTOMER: {state['customer_id']}")
-            else:
-                logger.info("🟢 HUMAN AGENT JOINED")
+                print(f"[ROOM EVENT] Customer identified: {state['customer_id']}\n")
     
     @ctx.room.on("track_subscribed")
     def on_track_subscribed(track: rtc.Track, publication: rtc.TrackPublication, participant: rtc.RemoteParticipant):
-        logger.info(f"🎧 TRACK: {participant.identity}")
+        print(f"[ROOM EVENT] track_subscribed: {participant.identity} - {track.kind}")
         
         if state["customer_id"] == "unknown" and participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
             if participant.identity.startswith("sip_"):
                 state["customer_id"] = extract_customer_id(participant.identity)
-                logger.info(f"📞 CUSTOMER (from track): {state['customer_id']}")
+                print(f"[ROOM EVENT] Customer from track: {state['customer_id']}\n")
     
     # ========================================================================
     # CHECK EXISTING PARTICIPANTS
     # ========================================================================
-    logger.info("🔍 Checking existing participants...")
+    print(f"[STARTUP] Checking existing participants...")
     for sid, p in ctx.room.remote_participants.items():
-        logger.info(f"👥 Found: {p.identity}")
+        print(f"[STARTUP] Found: {p.identity} (kind: {p.kind})")
         
         if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP and p.identity.startswith("sip_"):
             state["customer_id"] = extract_customer_id(p.identity)
-            logger.info(f"📞 CUSTOMER (existing): {state['customer_id']}")
+            print(f"[STARTUP] Customer set to: {state['customer_id']}")
             break
+    
+    print(f"[STARTUP] Final customer_id: {state['customer_id']}\n")
     
     # ========================================================================
     # OPENAI REALTIME SESSION
     # ========================================================================
+    print(f"[STARTUP] Creating OpenAI session...")
+    
     session = AgentSession(
         llm=openai.realtime.RealtimeModel(
             model="gpt-4o-realtime-preview-2024-12-17",
@@ -291,103 +309,150 @@ async def my_agent(ctx: JobContext):
         vad=ctx.proc.userdata["vad"],
     )
     
+    print(f"[STARTUP] Session created\n")
+    
     # ========================================================================
-    # SESSION EVENT HANDLERS - CRITICAL: Must be defined BEFORE session.start()
+    # SESSION EVENT HANDLERS
     # ========================================================================
+    
+    print(f"[STARTUP] Registering event handlers...")
     
     @session.on("user_input_transcribed")
     def on_user_transcribed(event):
         """Customer speaks"""
+        state["event_count"]["user_input_transcribed"] += 1
+        
+        print(f"\n{'*'*80}")
+        print(f"[EVENT] user_input_transcribed (count: {state['event_count']['user_input_transcribed']})")
+        print(f"[EVENT] is_final: {event.is_final}")
+        print(f"[EVENT] transcript: {event.transcript}")
+        print(f"{'*'*80}\n")
+        
         if not event.is_final:
+            print(f"[EVENT] Skipping (not final)\n")
             return
         
         transcript = event.transcript.strip()
         if not transcript:
+            print(f"[EVENT] Skipping (empty)\n")
             return
         
-        logger.info(f"👤 CUSTOMER: {transcript}")
+        print(f"[EVENT] Processing final transcript: {transcript}")
+        print(f"[EVENT] Will send to CCM as CONNECTOR\n")
         
-        # CRITICAL FIX: Use asyncio.ensure_future() instead of create_task()
-        # This works in synchronous event handlers
-        asyncio.ensure_future(
+        # Send to CCM
+        loop = asyncio.get_event_loop()
+        loop.create_task(
             send_to_ccm(call_id, state["customer_id"], transcript, "CONNECTOR")
         )
         
-        # Check transfer keywords
+        # Check transfer
         keywords = ["transfer", "human", "agent", "representative", "person", "someone"]
         if any(k in transcript.lower() for k in keywords):
-            logger.info(f"🔍 TRANSFER KEYWORD DETECTED")
-            asyncio.ensure_future(execute_transfer())
+            print(f"[EVENT] Transfer keyword detected!\n")
+            loop.create_task(execute_transfer())
     
     @session.on("agent_speech")
     def on_agent_speech(event):
-        """AI speaks - Primary handler"""
+        """AI speaks"""
+        state["event_count"]["agent_speech"] += 1
+        
+        print(f"\n{'*'*80}")
+        print(f"[EVENT] agent_speech (count: {state['event_count']['agent_speech']})")
+        print(f"[EVENT] Has text attr: {hasattr(event, 'text')}")
+        if hasattr(event, 'text'):
+            print(f"[EVENT] text: {event.text}")
+        print(f"{'*'*80}\n")
+        
         if hasattr(event, 'text') and event.text:
             text = event.text.strip()
             if not text:
+                print(f"[EVENT] Skipping (empty text)\n")
                 return
             
-            # Deduplicate
             text_hash = hash(text)
             if text_hash in state["sent_transcripts"]:
+                print(f"[EVENT] Skipping (duplicate)\n")
                 return
             
             state["sent_transcripts"].add(text_hash)
-            logger.info(f"🤖 AI: {text}")
+            print(f"[EVENT] Processing AI response: {text}")
+            print(f"[EVENT] Will send to CCM as BOT\n")
             
-            asyncio.ensure_future(
+            loop = asyncio.get_event_loop()
+            loop.create_task(
                 send_to_ccm(call_id, state["customer_id"], text, "BOT")
             )
     
     @session.on("conversation_item_added")
     def on_conversation_item(event):
-        """AI speaks - Backup handler"""
-        item = event.item
+        """Backup handler"""
+        state["event_count"]["conversation_item_added"] += 1
         
-        if item.role != "assistant":
+        print(f"\n{'*'*80}")
+        print(f"[EVENT] conversation_item_added (count: {state['event_count']['conversation_item_added']})")
+        print(f"[EVENT] item.role: {event.item.role if hasattr(event, 'item') else 'N/A'}")
+        print(f"{'*'*80}\n")
+        
+        if not hasattr(event, 'item') or event.item.role != "assistant":
+            print(f"[EVENT] Skipping (not assistant)\n")
             return
         
-        # Extract text
+        item = event.item
         text = None
+        
         if hasattr(item, 'text_content') and item.text_content:
             text = item.text_content.strip()
+            print(f"[EVENT] Found text_content: {text}")
         elif hasattr(item, 'content'):
             if isinstance(item.content, str):
                 text = item.content.strip()
+                print(f"[EVENT] Found content (str): {text}")
             elif isinstance(item.content, list):
                 for c in item.content:
                     if hasattr(c, 'text') and c.text:
                         text = c.text.strip()
+                        print(f"[EVENT] Found content (list): {text}")
                         break
         
         if not text:
+            print(f"[EVENT] No text found\n")
             return
         
-        # Deduplicate
         text_hash = hash(text)
         if text_hash in state["sent_transcripts"]:
+            print(f"[EVENT] Skipping (duplicate)\n")
             return
         
         state["sent_transcripts"].add(text_hash)
-        logger.info(f"🤖 AI (backup): {text}")
+        print(f"[EVENT] Processing backup AI: {text}")
+        print(f"[EVENT] Will send to CCM as BOT\n")
         
-        asyncio.ensure_future(
+        loop = asyncio.get_event_loop()
+        loop.create_task(
             send_to_ccm(call_id, state["customer_id"], text, "BOT")
         )
+    
+    print(f"[STARTUP] Event handlers registered\n")
     
     # ========================================================================
     # START SESSION
     # ========================================================================
-    logger.info("🚀 Starting session...")
+    print(f"[STARTUP] Starting session...")
     
     await session.start(
         agent=Assistant(call_id, state["customer_id"]),
         room=ctx.room,
     )
     
+    print(f"[STARTUP] Session started")
+    
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
     
-    logger.info(f"✅ CONNECTED TO ROOM: {call_id}")
+    print(f"[STARTUP] Connected to room")
+    print(f"{'#'*80}")
+    print(f"### AGENT READY - Waiting for conversation ###")
+    print(f"{'#'*80}\n")
 
 # ============================================================================
 # RUN SERVER

@@ -226,11 +226,19 @@ async def my_agent(ctx: JobContext):
         
         await send_to_ccm(call_id, customer_id, "Connecting you to our live agent...", "BOT")
 
-        # Update instructions to silence the bot BUT keep it listening for transcription
-        session.session_update(
-            instructions="You are now a silent scribe. Do not speak. Only listen and transcribe user speech."
-        )
-        
+        # Update instructions to silence the bot via generic conversation item
+        logger.info("silencing bot via conversation item")
+        try:
+             session.conversation.item.create(
+                openai.realtime.RealtimeItem(
+                    type="message",
+                    role="user",
+                    content=[{"type": "input_text", "text": "You are now a silent scribe. Do not speak. Only listen and transcribe."}]
+                )
+            )
+        except Exception as e:
+            logger.error(f"Failed to set silent mode: {e}")
+
         try:
             livekit_api = api.LiveKitAPI(
                 url=os.getenv("LIVEKIT_URL"),
@@ -487,11 +495,21 @@ async def my_agent(ctx: JobContext):
     welcome_text = "Welcome to ExpertFlow. How can I assist you today?"
     logger.info(f"📢 TRIGGERING WELCOME MESSAGE: '{welcome_text}'")
     
-    await session.response.create(
-        response={
-            "instructions": f"Say exactly: '{welcome_text}'",
-        }
-    )
+    # Use conversation item to trigger response since session.response might not be available
+    # We send a "user" message command which the model should reply to
+    try:
+        session.conversation.item.create(
+            openai.realtime.RealtimeItem(
+                type="message", 
+                role="user", 
+                content=[{"type": "input_text", "text": f"Say exactly: '{welcome_text}'"}]
+            )
+        )
+        # Attempt to trigger generation if possible, otherwise rely on VAD/auto-turn
+        if hasattr(session, 'response') and hasattr(session.response, 'create'):
+             await session.response.create()
+    except Exception as e:
+        logger.error(f"❌ Failed to trigger welcome message: {e}")
 
 # ============================================================================
 # RUN SERVER

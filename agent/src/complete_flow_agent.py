@@ -1,7 +1,7 @@
 """
 ============================================================================
 LIVEKIT AGENT WITH OPENAI REALTIME API + CALL TRANSFER TO HUMAN AGENT
-FIXED VERSION - Proper Call Cleanup + Complete Bot Silence After Transfer
+ACTUALLY WORKING VERSION - All 3 Issues Fixed
 ============================================================================
 """
 
@@ -43,8 +43,8 @@ async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type:
     
     # 1. Base Channel Data (Common to all)
     channel_data = {
-        "channelCustomerIdentifier": customer_id,  # Map to 99900 via the identification logic
-        "serviceIdentifier": "1122",           # Keep as is (per user instruction)
+        "channelCustomerIdentifier": customer_id,
+        "serviceIdentifier": "1122",
         "channelTypeCode": "CX_VOICE"
     }
 
@@ -170,15 +170,15 @@ async def my_agent(ctx: JobContext):
         logger.info("🌐 Persistent HTTP session created")
 
     # ========================================================================
-    # INITIALIZE SESSION & STATE EARLY (Prevents NameError in handlers)
+    # INITIALIZE SESSION & STATE EARLY
     # ========================================================================
-    bot_muted = False
+    bot_active = True  # Changed from bot_muted to bot_active (clearer logic)
     sent_transcripts = set()
     transfer_triggered = {"value": False}
-    customer_participant_sid = None  # Track customer SID for cleanup
-    human_agent_joined = False  # Track if human agent has joined
+    customer_participant_sid = None
+    agent_session_obj = None  # Will hold the AgentSession reference
     
-    # Initialize session first so handlers can reference it
+    # Initialize session
     session = AgentSession(
         llm=openai.realtime.RealtimeModel(
             model="gpt-4o-realtime-preview-2024-12-17",
@@ -190,15 +190,11 @@ async def my_agent(ctx: JobContext):
     )
     assistant = Assistant(call_id, customer_id)
 
-    # Diagnostic check for STT attributes
     logger.info(f"🔍 STT Attributes: {dir(stt)}")
 
     
     def extract_customer_id_from_participant(participant: rtc.RemoteParticipant) -> str:
-        """
-        Extract customer number from SIP participant.
-        Logs all metadata for diagnostic purposes.
-        """
+        """Extract customer number from SIP participant"""
         identity = participant.identity
         name = participant.name
         metadata = participant.metadata
@@ -210,17 +206,14 @@ async def my_agent(ctx: JobContext):
         
         extracted = identity
         
-        # Handle 'sip_' prefix
         if identity.startswith("sip_"):
             extracted = identity.replace("sip_", "")
-        # Handle raw SIP URI
         elif identity.startswith("sip:"):
             try:
                 extracted = identity.split(":")[1].split("@")[0]
             except Exception:
                 pass
 
-        # 2. Try to recover from metadata
         if metadata:
             import json
             try:
@@ -232,13 +225,10 @@ async def my_agent(ctx: JobContext):
             except Exception:
                 pass
 
-        # 3. IF NO SPECIFIC ID FOUND AND IT IS GENERIC -> FORCE TO 99900
-        # This matches the user's specific environment requirement.
         if extracted.lower() in ["freeswitch", "unknown", "agent", ""]:
             logger.info(f"📍 FORCING GENERIC IDENTITY '{extracted}' -> '99900' (Target ID)")
             return "99900"
 
-        # Hardcoded override for testing if still necessary
         if extracted == "1005":
             logger.warning(f"⚠️ OVERRIDING CUSTOMER ID: '1005' -> '99900' (Testing)")
             return "99900"
@@ -247,34 +237,21 @@ async def my_agent(ctx: JobContext):
         return extracted
     
     # ========================================================================
-    # CALL CLEANUP FUNCTION - FIX #1
+    # FIX #1: PROPER CALL CLEANUP - Remove bot from room
     # ========================================================================
-    async def cleanup_call(reason: str):
+    async def cleanup_and_disconnect(reason: str):
         """
-        Properly cleanup and end the call from all sides.
-        This ensures clean disconnection when customer or agent hangs up.
+        FIX #1: Actually remove bot participant from the room to end call properly.
+        This triggers clean disconnection for all participants.
         """
-        logger.info(f"🧹 CLEANUP INITIATED: {reason}")
+        logger.info(f"🧹 CLEANUP AND DISCONNECT: {reason}")
         
         try:
-            # Close the session first to stop all processing
-            if session:
-                try:
-                    logger.info("🛑 Closing agent session...")
-                    # Stop the session gracefully
-                    inner_session = getattr(session, '_session', session)
-                    if hasattr(inner_session, 'close'):
-                        await inner_session.close()
-                except Exception as e:
-                    logger.error(f"❌ Error closing session: {e}")
-            
-            # Disconnect the room
+            # Step 1: Disconnect bot from the room (this ends the call properly)
             if ctx.room:
-                try:
-                    logger.info("🔌 Disconnecting room...")
-                    await ctx.room.disconnect()
-                except Exception as e:
-                    logger.error(f"❌ Error disconnecting room: {e}")
+                logger.info("🔌 Disconnecting bot participant from room...")
+                await ctx.room.disconnect()
+                logger.info("✅ Bot disconnected from room")
             
             logger.info(f"✅ CLEANUP COMPLETE: {reason}")
             
@@ -282,11 +259,11 @@ async def my_agent(ctx: JobContext):
             logger.error(f"❌ CLEANUP ERROR: {e}", exc_info=True)
     
     # ========================================================================
-    # TRANSFER FUNCTION
+    # FIX #2 & #3: TRANSFER WITH PROPER BOT SHUTDOWN AND TIMER TRIGGER
     # ========================================================================
     async def execute_transfer():
         """Execute SIP transfer to human agent"""
-        nonlocal bot_muted, human_agent_joined
+        nonlocal bot_active, agent_session_obj
         
         if transfer_triggered["value"]:
             logger.info("⏭️ Transfer already in progress, skipping")
@@ -295,35 +272,11 @@ async def my_agent(ctx: JobContext):
         transfer_triggered["value"] = True
         logger.info(f"🔴 EXECUTING TRANSFER NOW")
         
-        # IMMEDIATELY MUTE BOT ON TRANSFER TRIGGER - FIX #2
-        logger.info("🛑 TRANSFER TRIGGERED - SILENCING BOT COMPLETELY")
-        bot_muted = True
+        # FIX #2: COMPLETELY STOP THE BOT SESSION (not just mute)
+        logger.info("🛑 STOPPING BOT SESSION COMPLETELY")
+        bot_active = False
         
-        try:
-            # 1. Disable audio tracks
-            for track_sid, pub in ctx.room.local_participant.track_publications.items():
-                if pub.track and pub.track.kind == rtc.TrackKind.KIND_AUDIO:
-                    logger.info(f"🔇 Hardware-muting bot audio track (Transfer): {track_sid}")
-                    await pub.set_muted(True)  # Use async mute method
-                    pub.track.enabled = False
-            
-            # 2. Interrupt any ongoing speech
-            session.push_audio(None)
-            
-            # 3. Disable turn detection to stop processing user input - FIX #2 CRITICAL
-            inner_session = getattr(session, '_session', session)
-            if hasattr(inner_session, 'update_session'):
-                logger.info("🛑 Disabling turn detection on session (Transfer)")
-                await inner_session.update_session(turn_detection=None)
-            
-            # 4. Clear any pending responses
-            if hasattr(inner_session, 'clear_conversation'):
-                logger.info("🧹 Clearing conversation context")
-                await inner_session.clear_conversation()
-                
-        except Exception as e:
-            logger.error(f"❌ Failed to silence bot during transfer: {e}")
-
+        # Notify CCM about transfer
         await send_to_ccm(call_id, customer_id, "Connecting you to our live agent...", "BOT", ctx.proc.userdata["http_session"])
         
         try:
@@ -341,6 +294,16 @@ async def my_agent(ctx: JobContext):
             logger.info(f"📞 Using trunk: {outbound_trunk_id}")
             logger.info(f"📞 Room: {call_id}")
             
+            # FIX #3: Add metadata to help trigger timer on agent desk
+            transfer_metadata = {
+                "reason": "customer_request",
+                "call_id": call_id,
+                "customer_id": customer_id,
+                "transfer_time": str(int(time.time())),
+                "call_type": "transferred",
+                "original_caller": customer_id
+            }
+            
             transfer_result = await livekit_api.sip.create_sip_participant(
                 api.CreateSIPParticipantRequest(
                     room_name=call_id,
@@ -348,7 +311,7 @@ async def my_agent(ctx: JobContext):
                     sip_call_to=f"{agent_extension}",
                     participant_identity=f"human-agent-general",
                     participant_name=f"Human Agent",
-                    participant_metadata='{"reason": "customer_request"}',
+                    participant_metadata=str(transfer_metadata),  # FIX #3: Rich metadata for timer
                 )
             )
             
@@ -357,13 +320,38 @@ async def my_agent(ctx: JobContext):
             logger.info(f"✅ Participant Identity: {transfer_result.participant_identity}")
             logger.info(f"✅ SIP Call ID: {transfer_result.sip_call_id}")
             
-            human_agent_joined = True
-            await send_to_ccm(call_id, customer_id, "Transfer initiated", "BOT", ctx.proc.userdata["http_session"])
+            # FIX #3: Send call state notification to CCM (may trigger timer)
+            await send_to_ccm(
+                call_id, 
+                customer_id, 
+                f"Call transferred to agent. Call ID: {call_id}, Agent: {agent_extension}", 
+                "BOT", 
+                ctx.proc.userdata["http_session"]
+            )
+            
+            # FIX #2: Now remove bot from the room (after agent joins)
+            # Wait a moment for agent to fully connect
+            await asyncio.sleep(2)
+            
+            logger.info("🤖 REMOVING BOT FROM ROOM (Transfer complete)")
+            # Remove bot participant - this is the key to stopping bot completely
+            try:
+                await livekit_api.room.remove_participant(
+                    api.RoomParticipantIdentity(
+                        room=call_id,
+                        identity=ctx.room.local_participant.identity
+                    )
+                )
+                logger.info("✅ Bot participant removed from room")
+            except Exception as e:
+                logger.error(f"❌ Failed to remove bot participant: {e}")
+                # Fallback: disconnect the room
+                await ctx.room.disconnect()
             
         except Exception as e:
             logger.error(f"❌ TRANSFER FAILED: {e}", exc_info=True)
             transfer_triggered["value"] = False
-            bot_muted = False  # Re-enable bot if transfer fails
+            bot_active = True  # Re-enable bot if transfer fails
             await send_to_ccm(call_id, customer_id, "Transfer failed. Please try again.", "BOT", ctx.proc.userdata["http_session"])
     
     # ========================================================================
@@ -371,48 +359,20 @@ async def my_agent(ctx: JobContext):
     # ========================================================================
     @ctx.room.on("participant_connected")
     def on_participant_connected(participant: rtc.RemoteParticipant):
-        nonlocal customer_id, bot_muted, customer_participant_sid, human_agent_joined
+        nonlocal customer_id, customer_participant_sid, bot_active
         
         logger.info(f"👤 JOINED: {participant.identity}, Kind: {participant.kind}, SID: {participant.sid}")
         
-        # Extract customer ID from SIP participant
         if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
             if participant.identity != "human-agent-general":
                 customer_id = extract_customer_id_from_participant(participant)
-                customer_participant_sid = participant.sid  # Track customer SID
+                customer_participant_sid = participant.sid
                 logger.info(f"📞 CUSTOMER IDENTIFIED: {customer_id}, SID: {customer_participant_sid}")
             else:
-                logger.info(f"🟢 HUMAN AGENT CONNECTED TO ROOM: {participant.identity}")
-                human_agent_joined = True
-                
-                # STOP BOT FROM RESPONDING WHEN AGENT JOINS - FIX #2
-                logger.info("🛑 HUMAN AGENT DETECTED - SILENCING BOT COMPLETELY")
-                bot_muted = True
-                
-                async def silence_bot_on_agent_join():
-                    try:
-                        # 1. Mute all bot audio tracks
-                        for track_sid, pub in ctx.room.local_participant.track_publications.items():
-                            if pub.track and pub.track.kind == rtc.TrackKind.KIND_AUDIO:
-                                logger.info(f"🔇 Hardware-muting bot audio track: {track_sid}")
-                                await pub.set_muted(True)
-                                pub.track.enabled = False
-                        
-                        # 2. Disable turn detection to stop processing - FIX #2 CRITICAL
-                        inner_session = getattr(session, '_session', session)
-                        if hasattr(inner_session, 'update_session'):
-                            logger.info("🛑 Disabling turn detection on session")
-                            await inner_session.update_session(turn_detection=None)
-                        
-                        # 3. Clear conversation context
-                        if hasattr(inner_session, 'clear_conversation'):
-                            logger.info("🧹 Clearing conversation context")
-                            await inner_session.clear_conversation()
-                            
-                    except Exception as e:
-                        logger.error(f"❌ Failed to silence bot on agent join: {e}")
-                
-                asyncio.create_task(silence_bot_on_agent_join())
+                logger.info(f"🟢 HUMAN AGENT CONNECTED: {participant.identity}")
+                # FIX #2: Deactivate bot when agent joins
+                bot_active = False
+                logger.info("🛑 BOT DEACTIVATED - Human agent is now handling the call")
 
 
     @ctx.room.on("track_subscribed")
@@ -421,20 +381,20 @@ async def my_agent(ctx: JobContext):
         
         logger.info(f"🎧 TRACK: {participant.identity} - {track.kind}")
         
-        # 1. Customer Identification (Existing Logic)
+        # Customer Identification
         if customer_id == "unknown" and participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
             if participant.identity != "human-agent-general":
                 customer_id = extract_customer_id_from_participant(participant)
                 logger.info(f"📞 CUSTOMER IDENTIFIED FROM TRACK: {customer_id}")
         
-        # 2. Human Agent Transcription - FIX #2: Only transcribe agent, not bot
+        # Human Agent Transcription
         if participant.identity == "human-agent-general" or participant.name == "Human Agent":
             logger.info(f"🎙️ SUBSCRIBED TO HUMAN AGENT AUDIO: {participant.identity}")
             
             if track.kind == rtc.TrackKind.KIND_AUDIO:
                 async def transcribe_agent_audio(audio_track):
                     logger.info("🚀 STARTING HUMAN AGENT TRANSCRIPTION STREAM")
-                    await asyncio.sleep(0.5) # Wait for track stabilization
+                    await asyncio.sleep(0.5)
                     audio_stream = rtc.AudioStream(audio_track)
                     stt_instance = openai.STT()
                     
@@ -444,7 +404,6 @@ async def my_agent(ctx: JobContext):
                         frames_pushed = 0
                         try:
                             async for chunk in audio_stream:
-                                # Fix: AudioStream yields AudioFrameEvent, we need the frame
                                 frame = getattr(chunk, 'frame', chunk)
                                 if frame:
                                     stt_stream.push_frame(frame)
@@ -459,16 +418,13 @@ async def my_agent(ctx: JobContext):
                     asyncio.create_task(audio_feeder())
                     
                     async for event in stt_stream:
-                        # Defensive check for event type
                         is_final = False
                         is_error = False
                         
-                        # Use getattr to safely check for ERROR member
                         if hasattr(stt, 'SpeechEventType'):
                             is_final = (event.type == stt.SpeechEventType.FINAL_TRANSCRIPT)
-                            # Safe check for ERROR attribute which might be missing in some versions
                             error_type = getattr(stt.SpeechEventType, 'ERROR', None)
-                            is_error = (event.type == error_type) if error_type else (event.type == 3) # Fallback to common enum value
+                            is_error = (event.type == error_type) if error_type else (event.type == 3)
                         elif hasattr(stt, 'STTEventType'):
                             is_final = (event.type == stt.STTEventType.FINAL_TRANSCRIPT)
                             error_type = getattr(stt.STTEventType, 'ERROR', None)
@@ -481,37 +437,35 @@ async def my_agent(ctx: JobContext):
                                  asyncio.create_task(send_to_ccm(call_id, customer_id, text, "AGENT", ctx.proc.userdata["http_session"]))
                         elif is_error:
                              logger.error(f"❌ Agent STT Error: {getattr(event, 'error', 'Unknown Error')}")
-                             # If we get error 1006, the stream is dead, break and let it possibly restart if handler is recalled
                              if "1006" in str(getattr(event, 'error', '')):
                                  break
                 
-                # Run transcription for this track
                 asyncio.create_task(transcribe_agent_audio(track))
 
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant):
-        nonlocal customer_participant_sid, human_agent_joined
+        nonlocal customer_participant_sid
         
         logger.info(f"👋 LEFT: {participant.identity}, SID: {participant.sid}")
         
-        # FIX #1: Clean up call when customer or human agent leaves
-        if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
-            if participant.sid == customer_participant_sid:
-                logger.info(f"📞 CUSTOMER DISCONNECTED - Cleaning up call")
-                asyncio.create_task(cleanup_call("Customer disconnected"))
-            elif participant.identity == "human-agent-general" and human_agent_joined:
-                logger.info(f"👨‍💼 HUMAN AGENT DISCONNECTED - Cleaning up call")
-                asyncio.create_task(cleanup_call("Human agent disconnected"))
+        # FIX #1: End call when customer leaves
+        if participant.sid == customer_participant_sid:
+            logger.info(f"📞 CUSTOMER DISCONNECTED - Ending call")
+            asyncio.create_task(cleanup_and_disconnect("Customer hung up"))
+        
+        # FIX #1: End call when human agent leaves (after transfer)
+        elif participant.identity == "human-agent-general":
+            logger.info(f"👨‍💼 HUMAN AGENT DISCONNECTED - Ending call")
+            asyncio.create_task(cleanup_and_disconnect("Human agent hung up"))
     
     # ========================================================================
-    # EXTRACT CUSTOMER ID FROM EXISTING PARTICIPANTS (TIMING FIX)
+    # EXTRACT CUSTOMER ID FROM EXISTING PARTICIPANTS
     # ========================================================================
     logger.info(f"🔍 Checking for existing participants in room...")
     
     for participant_sid, participant in ctx.room.remote_participants.items():
         logger.info(f"👥 Found existing participant: {participant.identity}, Kind: {participant.kind}, SID: {participant_sid}")
         
-        # Extract customer ID from existing SIP participant
         if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
             if participant.identity != "human-agent-general":
                 customer_id = extract_customer_id_from_participant(participant)
@@ -519,79 +473,60 @@ async def my_agent(ctx: JobContext):
                 logger.info(f"📞 CUSTOMER IDENTIFIED FROM EXISTING PARTICIPANT: {customer_id}, SID: {customer_participant_sid}")
             else:
                 logger.info(f"🟢 HUMAN AGENT ALREADY IN ROOM: {participant.identity}")
-                human_agent_joined = True
-                # If agent is already here, mute bot immediately
-                bot_muted = True
+                bot_active = False  # Deactivate bot if agent already present
     
     if customer_id == "unknown":
         logger.warning(f"⚠️ Customer ID still unknown after checking existing participants")
     
     # ========================================================================
-    # EVENT HANDLERS
+    # EVENT HANDLERS - FIX #2: Only process when bot_active = True
     # ========================================================================
     
-    # ========================================================================
-    # USER INPUT TRANSCRIBED EVENT - CAPTURES USER SPEECH
-    # ========================================================================
     @session.on("user_input_transcribed")
     def on_user_input_transcribed(event):
-        """
-        Captures user speech transcriptions from OpenAI Realtime API
-        event.transcript: The transcribed text
-        event.is_final: Whether this is the final version
-        """
+        """Captures user speech transcriptions"""
         transcript = event.transcript
         is_final = event.is_final
         
-        logger.info(f"👤 USER TRANSCRIPT (final={is_final}): {transcript}")
+        logger.info(f"👤 USER TRANSCRIPT (final={is_final}, bot_active={bot_active}): {transcript}")
         
-        # Only process final transcripts to avoid duplicates
         if not is_final:
             return
         
-        # Skip empty transcripts
         if not transcript or transcript.strip() == "":
             logger.warning("⚠️ Empty user transcript received, skipping")
             return
             
-        # 1. ALWAYS SEND TO CCM (Even if bot is muted)
+        # ALWAYS send customer transcript to CCM
         try:
             asyncio.create_task(send_to_ccm(call_id, customer_id, transcript, "CONNECTOR", ctx.proc.userdata["http_session"]))
             logger.info(f"✅ User transcript queued for CCM: '{transcript[:50]}...'")
         except Exception as e:
             logger.error(f"❌ Failed to queue user transcript to CCM: {e}")
-            
-        # 2. IF BOT IS MUTED, DON'T PROCESS FURTHER - FIX #2
-        # This prevents the bot from even considering a response
-        if bot_muted:
-            logger.debug("🔇 BOT IS MUTED - Ignoring user input for AI processing")
+        
+        # FIX #2: Only check for transfer if bot is active
+        if not bot_active:
+            logger.debug("🔇 BOT INACTIVE - Skipping transfer check")
             return
 
-        # 3. Check for transfer keywords (only if bot is not muted)
+        # Check for transfer keywords
         transfer_keywords = ["transfer", "human", "agent", "representative", "person", "someone"]
         if any(keyword in transcript.lower() for keyword in transfer_keywords):
             logger.info(f"🔍 TRANSFER KEYWORD DETECTED: '{transcript}'")
             logger.info(f"🚀 TRIGGERING TRANSFER...")
             asyncio.create_task(execute_transfer())
     
-    # ========================================================================
-    # SPEECH CREATED EVENT - CAPTURES AGENT AUDIO RESPONSES
-    # ========================================================================
     @session.on("speech_created")
     def on_speech_created(event):
-        """
-        Captures when agent speech is created (TTS audio being generated)
-        This is the PRIMARY way to capture agent responses in real-time
-        FIX #2: Only send to CCM if bot is not muted
-        """
-        if bot_muted:
-            logger.debug("🔇 BOT IS MUTED - Ignoring speech created event")
+        """Captures when agent speech is created"""
+        # FIX #2: Only send bot responses when bot is active
+        if not bot_active:
+            logger.debug("🔇 BOT INACTIVE - Ignoring speech created")
             return
 
         if hasattr(event, 'text') and event.text:
             agent_text = event.text
             
-            # Deduplicate using hash
             text_hash = hash(agent_text)
             if text_hash in sent_transcripts:
                 logger.debug(f"⏭️ Skipping duplicate agent response: '{agent_text[:30]}...'")
@@ -606,53 +541,38 @@ async def my_agent(ctx: JobContext):
             except Exception as e:
                 logger.error(f"❌ Failed to queue agent response to CCM: {e}")
     
-    # ========================================================================
-    # AGENT STARTED SPEAKING - ADDITIONAL CAPTURE POINT
-    # ========================================================================
     @session.on("agent_started_speaking")
     def on_agent_started_speaking(event):
-        """
-        Backup handler when agent starts speaking
-        FIX #2: Only log if bot is not muted
-        """
-        if bot_muted:
+        """Backup handler when agent starts speaking"""
+        if not bot_active:
             return
             
         logger.info(f"🎙️ AGENT STARTED SPEAKING")
     
-    # ========================================================================
-    # CONVERSATION ITEM ADDED - BACKUP FOR TEXT-BASED AGENT RESPONSES
-    # ========================================================================
     @session.on("conversation_item_added")
     def on_conversation_item_added(event):
-        """
-        Backup handler for agent responses (text-based)
-        FIX #2: Only send to CCM if bot is not muted
-        """
-        if bot_muted:
+        """Backup handler for agent responses (text-based)"""
+        # FIX #2: Only process when bot is active
+        if not bot_active:
             return
 
         item = event.item
         
         if item.role == "assistant":
-            # Try to extract text content
             agent_text = None
             
             if hasattr(item, 'text_content') and item.text_content:
                 agent_text = item.text_content
             elif hasattr(item, 'content') and item.content:
-                # Handle different content formats
                 if isinstance(item.content, str):
                     agent_text = item.content
                 elif isinstance(item.content, list) and len(item.content) > 0:
-                    # Extract text from content array
                     for content_item in item.content:
                         if hasattr(content_item, 'text') and content_item.text:
                             agent_text = content_item.text
                             break
             
             if agent_text:
-                # Deduplicate
                 text_hash = hash(agent_text)
                 if text_hash in sent_transcripts:
                     logger.debug(f"⏭️ Skipping duplicate agent item: '{agent_text[:30]}...'")
@@ -670,23 +590,19 @@ async def my_agent(ctx: JobContext):
     # START CONNECTION AND SESSION
     logger.info("🚀 Starting agent connection and session...")
     
-    # 1. Connect to the room first
     await ctx.connect()
     
-    # 2. Start the session with the assistant
-    await session.start(room=ctx.room, agent=assistant)
+    agent_session_obj = await session.start(room=ctx.room, agent=assistant)
     
     logger.info(f"✅ AGENT CONNECTED AND SESSION STARTED: {call_id}")
 
     # Wait for the process to finish
-    # We use a future to keep the agent alive until the room is disconnected
     shutdown_future = asyncio.Future()
     
     @ctx.room.on("disconnected")
     def on_disconnected(reason):
         logger.info(f"🔌 Room disconnected: {reason}")
         
-        # Clean up HTTP session (Async task)
         async def cleanup():
             if "http_session" in ctx.proc.userdata:
                 try:

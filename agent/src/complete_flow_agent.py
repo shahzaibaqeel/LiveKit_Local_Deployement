@@ -108,7 +108,7 @@ async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type:
             return await _post_to_ccm(new_session, payload, sender_type)
 
 async def _post_to_ccm(session: aiohttp.ClientSession, payload: dict, sender_type: str):
-    url = "https://efcx4-voice.expertflow.com/ccm/message/receive"
+    url = "https://efcx-dev2.expertflow.com/ccm/message/receive"
     try:
         async with session.post(
             url,

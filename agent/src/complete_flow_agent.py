@@ -1,4 +1,3 @@
-
 """
 ============================================================================
 LIVEKIT AGENT WITH OPENAI REALTIME API + CALL TRANSFER TO HUMAN AGENT

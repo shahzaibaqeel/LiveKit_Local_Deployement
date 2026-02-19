@@ -44,7 +44,7 @@ async def send_to_ccm(call_id: str, customer_id: str, message: str, sender_type:
     # 1. Base Channel Data (Common to all)
     channel_data = {
         "channelCustomerIdentifier": customer_id,  # Map to 99900 via the identification logic
-        "serviceIdentifier": "9876",           # Keep as is (per user instruction)
+        "serviceIdentifier": "1122",           # Keep as is (per user instruction)
         "channelTypeCode": "CX_VOICE"
     }
 

@@ -1,4 +1,3 @@
-
 """
 ============================================================================
 LIVEKIT AGENT WITH OPENAI REALTIME API + CALL TRANSFER TO HUMAN AGENT
@@ -267,11 +266,8 @@ async def my_agent(ctx: JobContext):
                     logger.info(f"🔇 Hardware-muting bot audio track (Transfer): {track_sid}")
                     pub.track.enabled = False
             
-            # Interrupt any ongoing speech by stopping the agent session
-            try:
-                await session.interrupt()
-            except Exception:
-                pass  # interrupt() may not be available in all versions
+            # Interupt any ongoing speech
+            session.push_audio(None) # Interupt
             
             inner_session = getattr(session, '_session', session)
             if hasattr(inner_session, 'update_session'):
@@ -301,9 +297,9 @@ async def my_agent(ctx: JobContext):
                 api.CreateSIPParticipantRequest(
                     room_name=call_id,
                     sip_trunk_id=outbound_trunk_id,
-                    sip_call_to=f"sip:{agent_extension}@{fusionpbx_ip}",
-                    participant_identity="human-agent-general",
-                    participant_name="Human Agent",
+                    sip_call_to=f"{agent_extension}",
+                    participant_identity=f"human-agent-general",
+                    participant_name=f"Human Agent",
                     participant_metadata='{"reason": "customer_request"}',
                 )
             )
@@ -319,11 +315,6 @@ async def my_agent(ctx: JobContext):
             logger.error(f"❌ TRANSFER FAILED: {e}", exc_info=True)
             transfer_triggered["value"] = False
             await send_to_ccm(call_id, customer_id, "Transfer failed. Please try again.", "BOT", ctx.proc.userdata["http_session"])
-        finally:
-            try:
-                await livekit_api.aclose()
-            except Exception:
-                pass
     
     # ========================================================================
     # TRANSCRIPTION HANDLERS

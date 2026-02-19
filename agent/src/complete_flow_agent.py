@@ -238,8 +238,8 @@ async def my_agent(ctx: JobContext):
             return "99900"
 
         # Hardcoded override for testing if still necessary
-        if extracted == "1005":
-            logger.warning(f"⚠️ OVERRIDING CUSTOMER ID: '1005' -> '99900' (Testing)")
+        if extracted == "10005":
+            logger.warning(f"⚠️ OVERRIDING CUSTOMER ID: '10005' -> '99900' (Testing)")
             return "99900"
             
         logger.info(f"✅ Final ID: {extracted}")
@@ -288,7 +288,7 @@ async def my_agent(ctx: JobContext):
             
             outbound_trunk_id = "ST_W7jqvDFA2VgG"
             agent_extension = "99900"
-            fusionpbx_ip = "192.168.2.24"
+            fusionpbx_ip = "192.168.1.17"
             
             logger.info(f"📞 Calling: sip:{agent_extension}@{fusionpbx_ip}:5060")
             logger.info(f"📞 Using trunk: {outbound_trunk_id}")

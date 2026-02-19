@@ -237,8 +237,8 @@ async def my_agent(ctx: JobContext):
             return "99900"
 
         # Hardcoded override for testing if still necessary
-        if extracted == "1005":
-            logger.warning(f"⚠️ OVERRIDING CUSTOMER ID: '1005' -> '99900' (Testing)")
+        if extracted == "10005":
+            logger.warning(f"⚠️ OVERRIDING CUSTOMER ID: '10005' -> '99900' (Testing)")
             return "99900"
             
         logger.info(f"✅ Final ID: {extracted}")
